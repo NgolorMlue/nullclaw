@@ -27,12 +27,15 @@ pub const ChannelMessage = struct {
     content: []const u8,
     channel: []const u8,
     timestamp: u64,
+    /// Where to send a reply (e.g., DM sender vs channel name in IRC, thread ID in Telegram).
+    reply_target: ?[]const u8 = null,
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.sender);
         allocator.free(self.content);
         allocator.free(self.channel);
+        if (self.reply_target) |rt| allocator.free(rt);
     }
 };
 
@@ -337,6 +340,30 @@ test "channel message struct fields" {
     try std.testing.expectEqualStrings("hello", msg.content);
     try std.testing.expectEqualStrings("slack", msg.channel);
     try std.testing.expectEqual(@as(u64, 1699999999), msg.timestamp);
+    try std.testing.expect(msg.reply_target == null);
+}
+
+test "channel message reply_target defaults to null" {
+    const msg = ChannelMessage{
+        .id = "id1",
+        .sender = "u1",
+        .content = "hi",
+        .channel = "irc",
+        .timestamp = 0,
+    };
+    try std.testing.expect(msg.reply_target == null);
+}
+
+test "channel message reply_target can be set" {
+    const msg = ChannelMessage{
+        .id = "id2",
+        .sender = "u2",
+        .content = "hi",
+        .channel = "irc",
+        .timestamp = 0,
+        .reply_target = "#mychannel",
+    };
+    try std.testing.expectEqualStrings("#mychannel", msg.reply_target.?);
 }
 
 test "channel vtable struct has all fields" {

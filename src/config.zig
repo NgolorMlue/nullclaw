@@ -3,8 +3,8 @@ const std = @import("std");
 // ── Autonomy Level ──────────────────────────────────────────────
 
 pub const AutonomyLevel = enum {
+    read_only,
     supervised,
-    semi_autonomous,
     full,
 };
 
@@ -61,6 +61,11 @@ pub const RuntimeConfig = struct {
     docker: DockerRuntimeConfig = .{},
 };
 
+pub const ModelFallbackEntry = struct {
+    model: []const u8,
+    fallbacks: []const []const u8,
+};
+
 pub const ReliabilityConfig = struct {
     provider_retries: u32 = 2,
     provider_backoff_ms: u64 = 500,
@@ -69,6 +74,8 @@ pub const ReliabilityConfig = struct {
     scheduler_poll_secs: u64 = 15,
     scheduler_retries: u32 = 2,
     fallback_providers: []const []const u8 = &.{},
+    api_keys: []const []const u8 = &.{},
+    model_fallbacks: []const ModelFallbackEntry = &.{},
 };
 
 pub const SchedulerConfig = struct {
@@ -107,18 +114,22 @@ pub const CronConfig = struct {
 
 pub const TelegramConfig = struct {
     bot_token: []const u8,
+    allowed_users: []const []const u8 = &.{},
 };
 
 pub const DiscordConfig = struct {
     bot_token: []const u8,
     guild_id: ?[]const u8 = null,
     listen_to_bots: bool = false,
+    allowed_users: []const []const u8 = &.{},
+    mention_only: bool = false,
 };
 
 pub const SlackConfig = struct {
     bot_token: []const u8,
     app_token: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
+    allowed_users: []const []const u8 = &.{},
 };
 
 pub const WebhookConfig = struct {
@@ -135,6 +146,7 @@ pub const MatrixConfig = struct {
     homeserver: []const u8,
     access_token: []const u8,
     room_id: []const u8,
+    allowed_users: []const []const u8 = &.{},
 };
 
 pub const WhatsAppConfig = struct {
@@ -142,6 +154,7 @@ pub const WhatsAppConfig = struct {
     phone_number_id: []const u8,
     verify_token: []const u8,
     app_secret: ?[]const u8 = null,
+    allowed_numbers: []const []const u8 = &.{},
 };
 
 pub const IrcConfig = struct {
@@ -149,10 +162,17 @@ pub const IrcConfig = struct {
     port: u16 = 6697,
     nickname: []const u8,
     username: ?[]const u8 = null,
+    channels: []const []const u8 = &.{},
+    allowed_users: []const []const u8 = &.{},
     server_password: ?[]const u8 = null,
     nickserv_password: ?[]const u8 = null,
     sasl_password: ?[]const u8 = null,
     verify_tls: bool = true,
+};
+
+pub const LarkReceiveMode = enum {
+    websocket,
+    webhook,
 };
 
 pub const LarkConfig = struct {
@@ -161,11 +181,15 @@ pub const LarkConfig = struct {
     encrypt_key: ?[]const u8 = null,
     verification_token: ?[]const u8 = null,
     use_feishu: bool = false,
+    allowed_users: []const []const u8 = &.{},
+    receive_mode: LarkReceiveMode = .websocket,
+    port: ?u16 = null,
 };
 
 pub const DingTalkConfig = struct {
     client_id: []const u8,
     client_secret: []const u8,
+    allowed_users: []const []const u8 = &.{},
 };
 
 pub const ChannelsConfig = struct {
@@ -267,6 +291,7 @@ pub const HttpRequestConfig = struct {
     enabled: bool = false,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
+    allowed_domains: []const []const u8 = &.{},
 };
 
 // ── Identity config ─────────────────────────────────────────────
@@ -318,6 +343,7 @@ pub const HardwareConfig = struct {
 pub const SandboxConfig = struct {
     enabled: ?bool = null,
     backend: SandboxBackend = .auto,
+    firejail_args: []const []const u8 = &.{},
 };
 
 pub const ResourceLimitsConfig = struct {
@@ -385,6 +411,7 @@ pub const Config = struct {
 
     // Top-level fields
     api_key: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
     default_temperature: f64 = 0.7,
@@ -508,6 +535,9 @@ pub const Config = struct {
         if (root.get("api_key")) |v| {
             if (v == .string) self.api_key = try self.allocator.dupe(u8, v.string);
         }
+        if (root.get("api_url")) |v| {
+            if (v == .string) self.api_url = try self.allocator.dupe(u8, v.string);
+        }
         if (root.get("default_temperature")) |v| {
             if (v == .float) self.default_temperature = v.float;
             if (v == .integer) self.default_temperature = @floatFromInt(v.integer);
@@ -610,10 +640,10 @@ pub const Config = struct {
                 }
                 if (aut.object.get("level")) |v| {
                     if (v == .string) {
-                        if (std.mem.eql(u8, v.string, "supervised")) {
+                        if (std.mem.eql(u8, v.string, "read_only")) {
+                            self.autonomy.level = .read_only;
+                        } else if (std.mem.eql(u8, v.string, "supervised")) {
                             self.autonomy.level = .supervised;
-                        } else if (std.mem.eql(u8, v.string, "semi_autonomous")) {
-                            self.autonomy.level = .semi_autonomous;
                         } else if (std.mem.eql(u8, v.string, "full")) {
                             self.autonomy.level = .full;
                         }
@@ -2446,7 +2476,7 @@ test "json parse integer temperature coerced to float" {
 
 test "autonomy level enum values" {
     try std.testing.expectEqualStrings("supervised", @tagName(AutonomyLevel.supervised));
-    try std.testing.expectEqualStrings("semi_autonomous", @tagName(AutonomyLevel.semi_autonomous));
+    try std.testing.expectEqualStrings("read_only", @tagName(AutonomyLevel.read_only));
     try std.testing.expectEqualStrings("full", @tagName(AutonomyLevel.full));
 }
 
@@ -2751,4 +2781,96 @@ test "json parse all new fields together" {
     allocator.free(cfg.gateway.paired_tokens);
     allocator.free(cfg.browser.allowed_domains[0]);
     allocator.free(cfg.browser.allowed_domains);
+}
+
+// ── Sprint 4: config gap fields ─────────────────────────────────
+
+test "config api_url defaults to null" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(cfg.api_url == null);
+}
+
+test "json parse api_url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"api_url": "http://10.0.0.1:11434"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("http://10.0.0.1:11434", cfg.api_url.?);
+    allocator.free(cfg.api_url.?);
+}
+
+test "lark receive mode enum values" {
+    try std.testing.expectEqualStrings("websocket", @tagName(LarkReceiveMode.websocket));
+    try std.testing.expectEqualStrings("webhook", @tagName(LarkReceiveMode.webhook));
+}
+
+test "lark config defaults" {
+    const lark = LarkConfig{ .app_id = "cli_123", .app_secret = "secret" };
+    try std.testing.expectEqual(@as(usize, 0), lark.allowed_users.len);
+    try std.testing.expectEqual(LarkReceiveMode.websocket, lark.receive_mode);
+    try std.testing.expect(lark.port == null);
+}
+
+test "channel configs allowed_users defaults to empty" {
+    const tg = TelegramConfig{ .bot_token = "tok" };
+    try std.testing.expectEqual(@as(usize, 0), tg.allowed_users.len);
+
+    const dc = DiscordConfig{ .bot_token = "tok" };
+    try std.testing.expectEqual(@as(usize, 0), dc.allowed_users.len);
+    try std.testing.expect(!dc.mention_only);
+
+    const sl = SlackConfig{ .bot_token = "tok" };
+    try std.testing.expectEqual(@as(usize, 0), sl.allowed_users.len);
+
+    const mx = MatrixConfig{ .homeserver = "h", .access_token = "t", .room_id = "r" };
+    try std.testing.expectEqual(@as(usize, 0), mx.allowed_users.len);
+
+    const dt = DingTalkConfig{ .client_id = "id", .client_secret = "sec" };
+    try std.testing.expectEqual(@as(usize, 0), dt.allowed_users.len);
+
+    const irc = IrcConfig{ .server = "irc.example.com", .nickname = "bot" };
+    try std.testing.expectEqual(@as(usize, 0), irc.allowed_users.len);
+    try std.testing.expectEqual(@as(usize, 0), irc.channels.len);
+}
+
+test "whatsapp config allowed_numbers defaults to empty" {
+    const wa = WhatsAppConfig{ .access_token = "t", .phone_number_id = "p", .verify_token = "v" };
+    try std.testing.expectEqual(@as(usize, 0), wa.allowed_numbers.len);
+}
+
+test "reliability config api_keys defaults empty" {
+    const r = ReliabilityConfig{};
+    try std.testing.expectEqual(@as(usize, 0), r.api_keys.len);
+    try std.testing.expectEqual(@as(usize, 0), r.model_fallbacks.len);
+}
+
+test "http request config allowed_domains defaults empty" {
+    const h = HttpRequestConfig{};
+    try std.testing.expectEqual(@as(usize, 0), h.allowed_domains.len);
+}
+
+test "autonomy level read_only exists" {
+    try std.testing.expectEqualStrings("read_only", @tagName(AutonomyLevel.read_only));
+    try std.testing.expectEqualStrings("supervised", @tagName(AutonomyLevel.supervised));
+    try std.testing.expectEqualStrings("full", @tagName(AutonomyLevel.full));
+}
+
+test "sandbox config firejail_args defaults empty" {
+    const s = SandboxConfig{};
+    try std.testing.expectEqual(@as(usize, 0), s.firejail_args.len);
+}
+
+test "model fallback entry constructible" {
+    const entry = ModelFallbackEntry{
+        .model = "claude-opus-4",
+        .fallbacks = &.{ "claude-sonnet-4", "gpt-4o" },
+    };
+    try std.testing.expectEqualStrings("claude-opus-4", entry.model);
+    try std.testing.expectEqual(@as(usize, 2), entry.fallbacks.len);
 }

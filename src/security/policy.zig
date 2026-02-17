@@ -219,6 +219,21 @@ pub const SecurityPolicy = struct {
             return false;
         }
 
+        // Block process substitution
+        if (containsStr(command, "<(") or containsStr(command, ">(")) {
+            return false;
+        }
+
+        // Block `tee` — can write to arbitrary files, bypassing redirect checks
+        {
+            var words_iter = std.mem.tokenizeAny(u8, command, " \t\n;|");
+            while (words_iter.next()) |word| {
+                if (std.mem.eql(u8, word, "tee") or std.mem.eql(u8, extractBasename(word), "tee")) {
+                    return false;
+                }
+            }
+        }
+
         // Block single & background chaining (&& is allowed)
         if (containsSingleAmpersand(command)) return false;
 
@@ -253,6 +268,9 @@ pub const SecurityPolicy = struct {
                 }
             }
             if (!found) return false;
+
+            // Block dangerous arguments for specific commands
+            if (!isArgsSafe(base_cmd, cmd_part)) return false;
         }
 
         return has_cmd;
@@ -482,6 +500,44 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     // Must match at component boundary
     if (path.len == prefix.len) return true;
     return path[prefix.len] == '/';
+}
+
+/// Check for dangerous arguments that allow sub-command execution.
+fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
+    const lower_base = lowerBuf(base_cmd);
+    const lower_cmd = lowerBuf(full_cmd);
+    const base = lower_base.slice();
+    const cmd = lower_cmd.slice();
+
+    if (std.mem.eql(u8, base, "find")) {
+        // find -exec and find -ok allow arbitrary command execution
+        var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+        while (iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "-exec") or std.mem.eql(u8, arg, "-ok")) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (std.mem.eql(u8, base, "git")) {
+        // git config, alias, and -c can set dangerous options
+        var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+        _ = iter.next(); // skip "git" itself
+        while (iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "config") or
+                std.mem.startsWith(u8, arg, "config.") or
+                std.mem.eql(u8, arg, "alias") or
+                std.mem.startsWith(u8, arg, "alias.") or
+                std.mem.eql(u8, arg, "-c"))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return true;
 }
 
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
@@ -1077,4 +1133,57 @@ test "containsSingleAmpersand detects correctly" {
     try std.testing.expect(!containsSingleAmpersand("cmd || other"));
     try std.testing.expect(!containsSingleAmpersand("normal command"));
     try std.testing.expect(!containsSingleAmpersand(""));
+}
+
+// ── Argument safety tests ───────────────────────────────────
+
+test "find -exec is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("find . -exec rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find / -ok cat {} \\;"));
+}
+
+test "find -name is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("find . -name '*.txt'"));
+    try std.testing.expect(p.isCommandAllowed("find . -type f"));
+}
+
+test "git config is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("git config core.editor \"rm -rf /\""));
+    try std.testing.expect(!p.isCommandAllowed("git alias.st status"));
+    try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+}
+
+test "git status is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("git status"));
+    try std.testing.expect(p.isCommandAllowed("git add ."));
+    try std.testing.expect(p.isCommandAllowed("git log"));
+}
+
+test "echo hello | tee /tmp/out is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("echo hello | tee /tmp/out"));
+    try std.testing.expect(!p.isCommandAllowed("ls | /usr/bin/tee outfile"));
+    try std.testing.expect(!p.isCommandAllowed("tee file.txt"));
+}
+
+test "echo hello | cat is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("echo hello | cat"));
+    try std.testing.expect(p.isCommandAllowed("ls | grep foo"));
+}
+
+test "cat <(echo hello) is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("cat <(echo hello)"));
+    try std.testing.expect(!p.isCommandAllowed("cat <(echo pwned)"));
+}
+
+test "echo text >(cat) is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("echo text >(cat)"));
+    try std.testing.expect(!p.isCommandAllowed("ls >(cat /etc/passwd)"));
 }

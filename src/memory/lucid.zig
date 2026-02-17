@@ -33,7 +33,7 @@ pub const LucidMemory = struct {
 
     const DEFAULT_LUCID_CMD = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 120;
+    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
     const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
@@ -367,20 +367,20 @@ pub const LucidMemory = struct {
         return "lucid";
     }
 
-    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory) anyerror!void {
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self = castSelf(ptr);
         // Store locally first (authoritative)
         const local = self.localMemory();
-        try local.store(key, content, category);
+        try local.store(key, content, category, session_id);
         // Fire-and-forget sync to lucid
         self.syncToLucid(key, content, category);
     }
 
-    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize) anyerror![]MemoryEntry {
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self = castSelf(ptr);
         const local = self.localMemory();
 
-        const local_results = try local.recall(allocator, query, limit);
+        const local_results = try local.recall(allocator, query, limit, session_id);
 
         // Short-circuit: local results sufficient
         if (limit == 0 or
@@ -411,9 +411,9 @@ pub const LucidMemory = struct {
         return self.localMemory().get(allocator, key);
     }
 
-    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory) anyerror![]MemoryEntry {
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self = castSelf(ptr);
-        return self.localMemory().list(allocator, category);
+        return self.localMemory().list(allocator, category, session_id);
     }
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
@@ -492,7 +492,7 @@ test "lucid store succeeds when lucid binary missing" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("lang", "User prefers Zig", .core);
+    try m.store("lang", "User prefers Zig", .core, null);
 
     const entry = try m.get(allocator, "lang");
     try std.testing.expect(entry != null);
@@ -515,9 +515,9 @@ test "lucid recall returns local results when lucid unavailable" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("pref", "Zig is fast", .core);
+    try m.store("pref", "Zig is fast", .core, null);
 
-    const results = try m.recall(allocator, "zig", 5);
+    const results = try m.recall(allocator, "zig", 5, null);
     defer root.freeEntries(allocator, results);
     try std.testing.expect(results.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, results[0].content, "Zig is fast") != null);
@@ -537,14 +537,14 @@ test "lucid list delegates to local" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "alpha", .core);
-    try m.store("b", "beta", .daily);
+    try m.store("a", "alpha", .core, null);
+    try m.store("b", "beta", .daily, null);
 
-    const all = try m.list(allocator, null);
+    const all = try m.list(allocator, null, null);
     defer root.freeEntries(allocator, all);
     try std.testing.expectEqual(@as(usize, 2), all.len);
 
-    const core_only = try m.list(allocator, .core);
+    const core_only = try m.list(allocator, .core, null);
     defer root.freeEntries(allocator, core_only);
     try std.testing.expectEqual(@as(usize, 1), core_only.len);
 }
@@ -563,7 +563,7 @@ test "lucid forget delegates to local" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("temp", "temporary data", .core);
+    try m.store("temp", "temporary data", .core, null);
     const forgotten = try m.forget("temp");
     try std.testing.expect(forgotten);
 
@@ -586,7 +586,7 @@ test "lucid count delegates to local" {
     const m = mem.memory();
 
     try std.testing.expectEqual(@as(usize, 0), try m.count());
-    try m.store("x", "data", .core);
+    try m.store("x", "data", .core, null);
     try std.testing.expectEqual(@as(usize, 1), try m.count());
 }
 
@@ -624,7 +624,7 @@ test "lucid failure cooldown is set on lucid failure" {
 
     // Attempt recall — lucid binary missing, should set cooldown
     const m = mem.memory();
-    const results = try m.recall(allocator, "test", 5);
+    const results = try m.recall(allocator, "test", 5, null);
     defer root.freeEntries(allocator, results);
 
     // After failed lucid attempt, cooldown should be active
@@ -757,18 +757,90 @@ test "lucid recall skips lucid when local hits meet threshold" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("pref", "Zig stays local-first", .core);
+    try m.store("pref", "Zig stays local-first", .core, null);
 
     // Store may have triggered cooldown from failed lucid sync — reset it
     // so we can verify recall itself doesn't set it again.
     mem.clearFailure();
     try std.testing.expect(!mem.inFailureCooldown());
 
-    const results = try m.recall(allocator, "zig", 5);
+    const results = try m.recall(allocator, "zig", 5, null);
     defer root.freeEntries(allocator, results);
     try std.testing.expect(results.len >= 1);
 
     // Cooldown should still NOT be set because recall short-circuited
     // (local hits >= threshold), so lucid was never attempted during recall.
     try std.testing.expect(!mem.inFailureCooldown());
+}
+
+test "lucid recall timeout is 500ms" {
+    try std.testing.expectEqual(@as(u64, 500), LucidMemory.DEFAULT_RECALL_TIMEOUT_MS);
+}
+
+test "lucid store accepts session_id" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithOptions(
+        allocator,
+        ":memory:",
+        "nonexistent-lucid-binary",
+        "/tmp/test",
+        200,
+        3,
+        2000,
+    );
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store with explicit session_id
+    try m.store("sess_key", "session data", .core, "session-abc");
+
+    const entry = try m.get(allocator, "sess_key");
+    try std.testing.expect(entry != null);
+    var e = entry.?;
+    defer e.deinit(allocator);
+    try std.testing.expectEqualStrings("session data", e.content);
+}
+
+test "lucid recall accepts session_id" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithOptions(
+        allocator,
+        ":memory:",
+        "nonexistent-lucid-binary",
+        "/tmp/test",
+        200,
+        3,
+        2000,
+    );
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store with same session_id so it's retrievable by that session
+    try m.store("data", "searchable content", .core, "session-abc");
+
+    const results = try m.recall(allocator, "searchable", 5, "session-abc");
+    defer root.freeEntries(allocator, results);
+    try std.testing.expect(results.len >= 1);
+}
+
+test "lucid list accepts session_id" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithOptions(
+        allocator,
+        ":memory:",
+        "nonexistent-lucid-binary",
+        "/tmp/test",
+        200,
+        3,
+        2000,
+    );
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store with same session_id so it's listable by that session
+    try m.store("a", "alpha", .core, "session-abc");
+
+    const results = try m.list(allocator, null, "session-abc");
+    defer root.freeEntries(allocator, results);
+    try std.testing.expect(results.len >= 1);
 }

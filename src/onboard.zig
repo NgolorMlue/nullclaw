@@ -303,7 +303,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     cfg.autonomy.level = switch (autonomy_idx) {
         0 => .supervised,
-        1 => .semi_autonomous,
+        1 => .read_only,
         2 => .full,
         else => .supervised,
     };
@@ -968,8 +968,8 @@ test "wizard promptChoice returns default for out-of-range" {
 test "wizard maps autonomy index to enum correctly" {
     // Verify the mapping used in runWizard
     const Config2 = @import("config.zig");
-    const mapping = [_]Config2.AutonomyLevel{ .supervised, .semi_autonomous, .full };
+    const mapping = [_]Config2.AutonomyLevel{ .supervised, .read_only, .full };
     try std.testing.expect(mapping[0] == .supervised);
-    try std.testing.expect(mapping[1] == .semi_autonomous);
+    try std.testing.expect(mapping[1] == .read_only);
     try std.testing.expect(mapping[2] == .full);
 }

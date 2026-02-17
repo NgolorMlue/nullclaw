@@ -20,7 +20,7 @@ pub const SNAPSHOT_FILENAME = "MEMORY_SNAPSHOT.json";
 /// Returns the number of entries exported.
 pub fn exportSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_dir: []const u8) !usize {
     // List all core memories
-    const entries = try mem.list(allocator, .core);
+    const entries = try mem.list(allocator, .core, null);
     defer root.freeEntries(allocator, entries);
 
     if (entries.len == 0) return 0;
@@ -117,7 +117,7 @@ pub fn hydrateFromSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_
             category = MemoryCategory.fromString(cat_str);
         }
 
-        mem.store(key, entry_content, category) catch continue;
+        mem.store(key, entry_content, category, null) catch continue;
         hydrated += 1;
     }
 
@@ -212,7 +212,7 @@ test "shouldHydrate with non-empty memory" {
     const mem = mem_impl.memory();
 
     // Store something
-    try mem.store("test", "data", .core);
+    try mem.store("test", "data", .core, null);
 
     // Should not hydrate because memory is not empty
     try std.testing.expect(!shouldHydrate(std.testing.allocator, mem, "/nonexistent"));

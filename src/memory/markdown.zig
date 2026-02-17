@@ -170,7 +170,7 @@ pub const MarkdownMemory = struct {
         return "markdown";
     }
 
-    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory) anyerror!void {
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, _: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const entry_text = try std.fmt.allocPrint(self_.allocator, "- **{s}**: {s}", .{ key, content });
         defer self_.allocator.free(entry_text);
@@ -184,7 +184,7 @@ pub const MarkdownMemory = struct {
         try appendToFile(path, entry_text, self_.allocator);
     }
 
-    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize) anyerror![]MemoryEntry {
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, _: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const all = try self_.readAllEntries(allocator);
@@ -261,7 +261,7 @@ pub const MarkdownMemory = struct {
         return found;
     }
 
-    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory) anyerror![]MemoryEntry {
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const all = try self_.readAllEntries(allocator);
@@ -443,4 +443,25 @@ test "markdown parseEntries preserves category" {
     }
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expect(entries[0].category.eql(.daily));
+}
+
+test "markdown accepts session_id param" {
+    var mem = try MarkdownMemory.init(std.testing.allocator, "/tmp/nullclaw-test-md-session");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // session_id is accepted but ignored by markdown backend
+    try m.store("sess_key", "session data", .core, "session-123");
+
+    const recalled = try m.recall(std.testing.allocator, "session", 10, "session-123");
+    defer {
+        for (recalled) |*e| e.deinit(std.testing.allocator);
+        std.testing.allocator.free(recalled);
+    }
+
+    const listed = try m.list(std.testing.allocator, null, "session-123");
+    defer {
+        for (listed) |*e| e.deinit(std.testing.allocator);
+        std.testing.allocator.free(listed);
+    }
 }

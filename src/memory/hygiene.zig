@@ -60,7 +60,7 @@ pub fn runIfDue(config: HygieneConfig, mem: ?Memory) HygieneReport {
         const now = std.time.timestamp();
         var buf: [20]u8 = undefined;
         const ts = std.fmt.bufPrint(&buf, "{d}", .{now}) catch return report;
-        m.store(LAST_HYGIENE_KEY, ts, .core) catch {};
+        m.store(LAST_HYGIENE_KEY, ts, .core, null) catch {};
     }
 
     return report;

@@ -5,6 +5,141 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 
+// ─── Tool Call Response Structures ───────────────────────────────────────────
+
+const OllamaFunction = struct {
+    name: []const u8 = "",
+    arguments: std.json.Value = .null,
+};
+
+const OllamaToolCall = struct {
+    id: ?[]const u8 = null,
+    function: OllamaFunction = .{},
+};
+
+const OllamaMessage = struct {
+    role: []const u8 = "",
+    content: ?[]const u8 = null,
+    thinking: ?[]const u8 = null,
+    tool_calls: ?[]const OllamaToolCall = null,
+};
+
+const OllamaChatResponse = struct {
+    message: OllamaMessage = .{},
+};
+
+// ─── Tool Call Helpers ───────────────────────────────────────────────────────
+
+/// Extract actual tool name and arguments from potentially quirky tool call formats.
+///
+/// Handles 3 patterns local models commonly produce:
+/// 1. Nested wrapper: {"name":"tool_call","arguments":{"name":"shell","arguments":{...}}}
+/// 2. Prefixed names: "tool.shell" -> "shell"
+/// 3. Normal: return as-is
+fn extractToolNameAndArgs(
+    name: []const u8,
+    arguments: std.json.Value,
+) struct { name: []const u8, args: std.json.Value } {
+    // Pattern 1: Nested tool_call wrapper
+    if (std.mem.eql(u8, name, "tool_call") or
+        std.mem.eql(u8, name, "tool.call") or
+        std.mem.startsWith(u8, name, "tool_call>") or
+        std.mem.startsWith(u8, name, "tool_call<"))
+    {
+        if (arguments == .object) {
+            if (arguments.object.get("name")) |nested_name_val| {
+                if (nested_name_val == .string) {
+                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(std.heap.page_allocator) };
+                    return .{ .name = nested_name_val.string, .args = nested_args };
+                }
+            }
+        }
+    }
+
+    // Pattern 2: Prefixed tool name (tool.shell -> shell, tools.shell -> shell)
+    if (std.mem.startsWith(u8, name, "tools.")) {
+        return .{ .name = name["tools.".len..], .args = arguments };
+    }
+    if (std.mem.startsWith(u8, name, "tool.")) {
+        return .{ .name = name["tool.".len..], .args = arguments };
+    }
+
+    // Pattern 3: Normal
+    return .{ .name = name, .args = arguments };
+}
+
+/// Convert Ollama native tool calls to the JSON format expected by the agent loop.
+///
+/// Produces OpenAI-compatible JSON:
+/// {"content":"","tool_calls":[{"id":"call_0","type":"function","function":{"name":"shell","arguments":"{...}"}}]}
+fn formatToolCallsForLoop(
+    allocator: std.mem.Allocator,
+    message: OllamaMessage,
+) ![]const u8 {
+    const tool_calls = message.tool_calls orelse return try allocator.dupe(u8, message.content orelse "");
+    if (tool_calls.len == 0) return try allocator.dupe(u8, message.content orelse "");
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    try result.appendSlice(allocator, "{\"content\":\"\",\"tool_calls\":[");
+
+    for (tool_calls, 0..) |tc, i| {
+        if (i > 0) try result.append(allocator, ',');
+
+        const extracted = extractToolNameAndArgs(tc.function.name, tc.function.arguments);
+
+        // Serialize arguments to string
+        const args_str = if (extracted.args == .null)
+            try allocator.dupe(u8, "{}")
+        else
+            try std.json.Stringify.valueAlloc(allocator, extracted.args, .{});
+        defer allocator.free(args_str);
+
+        // Escape the args_str for embedding in JSON string
+        const escaped_args = try jsonEscapeString(allocator, args_str);
+        defer allocator.free(escaped_args);
+
+        // Build the call ID
+        const call_id = if (tc.id) |id|
+            try allocator.dupe(u8, id)
+        else
+            try std.fmt.allocPrint(allocator, "call_{d}", .{i});
+        defer allocator.free(call_id);
+
+        try result.appendSlice(allocator, "{\"id\":\"");
+        try result.appendSlice(allocator, call_id);
+        try result.appendSlice(allocator, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+        try result.appendSlice(allocator, extracted.name);
+        try result.appendSlice(allocator, "\",\"arguments\":\"");
+        try result.appendSlice(allocator, escaped_args);
+        try result.appendSlice(allocator, "\"}}");
+    }
+
+    try result.appendSlice(allocator, "]}");
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Escape a string for embedding inside a JSON string value.
+fn jsonEscapeString(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Ollama local LLM provider.
 ///
 /// Endpoints:
@@ -55,21 +190,40 @@ pub const OllamaProvider = struct {
         }
     }
 
-    /// Parse text content from an Ollama response.
+    /// Parse an Ollama response, handling tool calls, thinking-only, and plain text.
     pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        const parsed = try std.json.parseFromSlice(OllamaChatResponse, allocator, body, .{
+            .ignore_unknown_fields = true,
+        });
         defer parsed.deinit();
-        const root_obj = parsed.value.object;
+        const message = parsed.value.message;
 
-        if (root_obj.get("message")) |msg| {
-            if (msg.object.get("content")) |content| {
-                if (content == .string) {
-                    return try allocator.dupe(u8, content.string);
-                }
+        // If model returned tool calls, format them for the agent loop
+        if (message.tool_calls) |tcs| {
+            if (tcs.len > 0) {
+                return formatToolCallsForLoop(allocator, message);
             }
         }
 
-        return error.NoResponseContent;
+        // Plain text response
+        if (message.content) |content| {
+            if (content.len > 0) {
+                return try allocator.dupe(u8, content);
+            }
+        }
+
+        // Thinking-only response (model reasoned but produced no output)
+        if (message.thinking) |thinking| {
+            const preview_len = @min(thinking.len, 200);
+            return try std.fmt.allocPrint(
+                allocator,
+                "I was thinking about this: {s}... but I didn't complete my response. Could you try asking again?",
+                .{thinking[0..preview_len]},
+            );
+        }
+
+        // Empty response
+        return try allocator.dupe(u8, "");
     }
 
     /// Create a Provider interface from this OllamaProvider.
@@ -235,4 +389,170 @@ test "supportsNativeTools returns false" {
     var p = OllamaProvider.init(std.testing.allocator, null);
     const prov = p.provider();
     try std.testing.expect(!prov.supportsNativeTools());
+}
+
+// ─── Tool Call Tests ─────────────────────────────────────────────────────────
+
+test "extractToolNameAndArgs with normal name" {
+    const result = extractToolNameAndArgs("shell", .null);
+    try std.testing.expectEqualStrings("shell", result.name);
+}
+
+test "extractToolNameAndArgs with tool. prefix" {
+    const result = extractToolNameAndArgs("tool.shell", .null);
+    try std.testing.expectEqualStrings("shell", result.name);
+}
+
+test "extractToolNameAndArgs with tools. prefix" {
+    const result = extractToolNameAndArgs("tools.file_read", .null);
+    try std.testing.expectEqualStrings("file_read", result.name);
+}
+
+test "extractToolNameAndArgs with nested tool_call wrapper" {
+    // Build a JSON object: {"name":"shell","arguments":{"command":"date"}}
+    const json_str =
+        \\{"name":"shell","arguments":{"command":"date"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs("tool_call", parsed.value);
+    try std.testing.expectEqualStrings("shell", result.name);
+    // The inner arguments should contain "command"
+    try std.testing.expect(result.args == .object);
+    const cmd = result.args.object.get("command") orelse unreachable;
+    try std.testing.expect(cmd == .string);
+    try std.testing.expectEqualStrings("date", cmd.string);
+}
+
+test "extractToolNameAndArgs with tool.call wrapper" {
+    const json_str =
+        \\{"name":"file_read","arguments":{"path":"/tmp"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = extractToolNameAndArgs("tool.call", parsed.value);
+    try std.testing.expectEqualStrings("file_read", result.name);
+}
+
+test "formatToolCallsForLoop with single tool call" {
+    const alloc = std.testing.allocator;
+    const json_str =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_abc","function":{"name":"shell","arguments":{"command":"date"}}}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(OllamaChatResponse, alloc, json_str, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const result = try formatToolCallsForLoop(alloc, parsed.value.message);
+    defer alloc.free(result);
+
+    // Verify it's valid JSON
+    const verify = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer verify.deinit();
+
+    // Should have tool_calls array
+    const tool_calls = verify.value.object.get("tool_calls").?.array;
+    try std.testing.expect(tool_calls.items.len == 1);
+
+    // Check function name
+    const func = tool_calls.items[0].object.get("function").?;
+    try std.testing.expectEqualStrings("shell", func.object.get("name").?.string);
+
+    // Arguments should be a string (JSON-encoded)
+    try std.testing.expect(func.object.get("arguments").? == .string);
+
+    // Check ID
+    try std.testing.expectEqualStrings("call_abc", tool_calls.items[0].object.get("id").?.string);
+}
+
+test "formatToolCallsForLoop with no tool calls returns content" {
+    const alloc = std.testing.allocator;
+    const msg = OllamaMessage{
+        .role = "assistant",
+        .content = "Hello there!",
+        .tool_calls = null,
+    };
+    const result = try formatToolCallsForLoop(alloc, msg);
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("Hello there!", result);
+}
+
+test "formatToolCallsForLoop with empty tool calls returns content" {
+    const alloc = std.testing.allocator;
+    const empty_tcs: []const OllamaToolCall = &.{};
+    const msg = OllamaMessage{
+        .role = "assistant",
+        .content = "Fallback content",
+        .tool_calls = empty_tcs,
+    };
+    const result = try formatToolCallsForLoop(alloc, msg);
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("Fallback content", result);
+}
+
+test "formatToolCallsForLoop generates call_N id when id is null" {
+    const alloc = std.testing.allocator;
+    const tcs = [_]OllamaToolCall{.{
+        .id = null,
+        .function = .{ .name = "shell", .arguments = .null },
+    }};
+    const msg = OllamaMessage{
+        .role = "assistant",
+        .content = "",
+        .tool_calls = &tcs,
+    };
+    const result = try formatToolCallsForLoop(alloc, msg);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"call_0\"") != null);
+}
+
+test "parseResponse with tool calls produces formatted JSON" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"shell","arguments":{"command":"ls"}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    // Should be valid JSON with tool_calls
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("tool_calls") != null);
+}
+
+test "parseResponse thinking-only returns fallback message" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","thinking":"Let me reason about this carefully..."}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "I was thinking about this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Let me reason") != null);
+}
+
+test "parseResponse with tool_call nested wrapper unwraps correctly" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell","arguments":{"command":"whoami"}}}}]}}
+    ;
+    const result = try OllamaProvider.parseResponse(alloc, body);
+    defer alloc.free(result);
+
+    // The formatted output should contain the unwrapped tool name "shell"
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    // And should NOT have "tool_call" as the function name
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"tool_call\"") == null);
+}
+
+test "jsonEscapeString escapes quotes and backslashes" {
+    const alloc = std.testing.allocator;
+    const result = try jsonEscapeString(alloc, "he said \"hello\\world\"");
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("he said \\\"hello\\\\world\\\"", result);
 }

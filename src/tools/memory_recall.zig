@@ -56,7 +56,7 @@ pub const MemoryRecallTool = struct {
             return ToolResult{ .success = true, .output = msg };
         };
 
-        const entries = m.recall(allocator, query, limit) catch |err| {
+        const entries = m.recall(allocator, query, limit, null) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };

@@ -379,6 +379,9 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
     if (std.mem.eql(u8, name, "cohere")) return .{ "COHERE_API_KEY", "", "" };
     if (std.mem.eql(u8, name, "venice")) return .{ "VENICE_API_KEY", "", "" };
     if (std.mem.eql(u8, name, "moonshot") or std.mem.eql(u8, name, "kimi")) return .{ "MOONSHOT_API_KEY", "", "" };
+    if (std.mem.eql(u8, name, "nvidia") or std.mem.eql(u8, name, "nvidia-nim") or std.mem.eql(u8, name, "build.nvidia.com")) return .{ "NVIDIA_API_KEY", "", "" };
+    if (std.mem.eql(u8, name, "astrai")) return .{ "ASTRAI_API_KEY", "", "" };
+    if (std.mem.eql(u8, name, "lmstudio") or std.mem.eql(u8, name, "lm-studio")) return .{ "", "", "" };
     return .{ "", "", "" };
 }
 
@@ -406,16 +409,17 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
 
     // OpenAI-compatible providers
     const compat_names = [_][]const u8{
-        "venice",        "vercel",         "vercel-ai",      "cloudflare",
-        "cloudflare-ai", "moonshot",       "kimi",           "synthetic",
-        "opencode",      "opencode-zen",   "zai",            "z.ai",
-        "glm",           "zhipu",          "minimax",        "bedrock",
-        "aws-bedrock",   "qianfan",        "baidu",          "qwen",
-        "dashscope",     "qwen-intl",      "dashscope-intl", "qwen-us",
-        "dashscope-us",  "groq",           "mistral",        "xai",
-        "grok",          "deepseek",       "together",       "together-ai",
-        "fireworks",     "fireworks-ai",   "perplexity",     "cohere",
-        "copilot",       "github-copilot",
+        "venice",        "vercel",         "vercel-ai",        "cloudflare",
+        "cloudflare-ai", "moonshot",       "kimi",             "synthetic",
+        "opencode",      "opencode-zen",   "zai",              "z.ai",
+        "glm",           "zhipu",          "minimax",          "bedrock",
+        "aws-bedrock",   "qianfan",        "baidu",            "qwen",
+        "dashscope",     "qwen-intl",      "dashscope-intl",   "qwen-us",
+        "dashscope-us",  "groq",           "mistral",          "xai",
+        "grok",          "deepseek",       "together",         "together-ai",
+        "fireworks",     "fireworks-ai",   "perplexity",       "cohere",
+        "copilot",       "github-copilot", "lmstudio",         "lm-studio",
+        "nvidia",        "nvidia-nim",     "build.nvidia.com", "astrai",
     };
 
     for (compat_names) |cn| {
@@ -424,6 +428,9 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
 
     // custom: prefix
     if (std.mem.startsWith(u8, name, "custom:")) return .compatible_provider;
+
+    // anthropic-custom: prefix
+    if (std.mem.startsWith(u8, name, "anthropic-custom:")) return .anthropic_provider;
 
     return .unknown;
 }
@@ -453,6 +460,9 @@ pub fn compatibleProviderUrl(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "perplexity")) return "https://api.perplexity.ai";
     if (std.mem.eql(u8, name, "cohere")) return "https://api.cohere.com/compatibility";
     if (std.mem.eql(u8, name, "copilot") or std.mem.eql(u8, name, "github-copilot")) return "https://api.githubcopilot.com";
+    if (std.mem.eql(u8, name, "lmstudio") or std.mem.eql(u8, name, "lm-studio")) return "http://localhost:1234/v1";
+    if (std.mem.eql(u8, name, "nvidia") or std.mem.eql(u8, name, "nvidia-nim") or std.mem.eql(u8, name, "build.nvidia.com")) return "https://integrate.api.nvidia.com/v1";
+    if (std.mem.eql(u8, name, "astrai")) return "https://as-trai.com/v1";
     return null;
 }
 
@@ -481,6 +491,9 @@ pub fn compatibleProviderDisplayName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "perplexity")) return "Perplexity";
     if (std.mem.eql(u8, name, "cohere")) return "Cohere";
     if (std.mem.eql(u8, name, "copilot") or std.mem.eql(u8, name, "github-copilot")) return "GitHub Copilot";
+    if (std.mem.eql(u8, name, "lmstudio") or std.mem.eql(u8, name, "lm-studio")) return "LM Studio";
+    if (std.mem.eql(u8, name, "nvidia") or std.mem.eql(u8, name, "nvidia-nim") or std.mem.eql(u8, name, "build.nvidia.com")) return "NVIDIA NIM";
+    if (std.mem.eql(u8, name, "astrai")) return "Astrai";
     return "Custom";
 }
 
@@ -849,6 +862,74 @@ test "provider chatWithTools falls back to chat when vtable is null" {
     const resp = try provider.chatWithTools(std.testing.allocator, req);
     try std.testing.expectEqualStrings("fallback response", resp.content.?);
     try std.testing.expectEqualStrings("test-model", resp.model);
+}
+
+test "nvidia resolves to correct URL" {
+    try std.testing.expectEqualStrings("https://integrate.api.nvidia.com/v1", compatibleProviderUrl("nvidia").?);
+}
+
+test "nvidia-nim resolves to correct URL" {
+    try std.testing.expectEqualStrings("https://integrate.api.nvidia.com/v1", compatibleProviderUrl("nvidia-nim").?);
+}
+
+test "lmstudio resolves to localhost:1234" {
+    try std.testing.expectEqualStrings("http://localhost:1234/v1", compatibleProviderUrl("lmstudio").?);
+}
+
+test "lm-studio resolves to localhost:1234" {
+    try std.testing.expectEqualStrings("http://localhost:1234/v1", compatibleProviderUrl("lm-studio").?);
+}
+
+test "astrai resolves to astrai API URL" {
+    try std.testing.expectEqualStrings("https://as-trai.com/v1", compatibleProviderUrl("astrai").?);
+}
+
+test "anthropic-custom prefix classifies as anthropic provider" {
+    try std.testing.expect(classifyProvider("anthropic-custom:https://my-api.example.com") == .anthropic_provider);
+}
+
+test "NVIDIA_API_KEY env resolves nvidia credential" {
+    const allocator = std.testing.allocator;
+    // providerEnvCandidates returns NVIDIA_API_KEY for nvidia
+    const candidates = providerEnvCandidates("nvidia");
+    try std.testing.expectEqualStrings("NVIDIA_API_KEY", candidates[0]);
+    // Also check aliases
+    const candidates_nim = providerEnvCandidates("nvidia-nim");
+    try std.testing.expectEqualStrings("NVIDIA_API_KEY", candidates_nim[0]);
+    const candidates_build = providerEnvCandidates("build.nvidia.com");
+    try std.testing.expectEqualStrings("NVIDIA_API_KEY", candidates_build[0]);
+    _ = allocator;
+}
+
+test "lmstudio does not require API key — uses empty env candidates" {
+    const candidates = providerEnvCandidates("lmstudio");
+    // lmstudio has no env var (empty first entry means no provider-specific env)
+    try std.testing.expectEqualStrings("", candidates[0]);
+    const candidates_alias = providerEnvCandidates("lm-studio");
+    try std.testing.expectEqualStrings("", candidates_alias[0]);
+}
+
+test "new providers display names" {
+    try std.testing.expectEqualStrings("NVIDIA NIM", compatibleProviderDisplayName("nvidia"));
+    try std.testing.expectEqualStrings("NVIDIA NIM", compatibleProviderDisplayName("nvidia-nim"));
+    try std.testing.expectEqualStrings("NVIDIA NIM", compatibleProviderDisplayName("build.nvidia.com"));
+    try std.testing.expectEqualStrings("LM Studio", compatibleProviderDisplayName("lmstudio"));
+    try std.testing.expectEqualStrings("LM Studio", compatibleProviderDisplayName("lm-studio"));
+    try std.testing.expectEqualStrings("Astrai", compatibleProviderDisplayName("astrai"));
+}
+
+test "new providers classify as compatible" {
+    try std.testing.expect(classifyProvider("nvidia") == .compatible_provider);
+    try std.testing.expect(classifyProvider("nvidia-nim") == .compatible_provider);
+    try std.testing.expect(classifyProvider("build.nvidia.com") == .compatible_provider);
+    try std.testing.expect(classifyProvider("lmstudio") == .compatible_provider);
+    try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
+    try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
+}
+
+test "astrai env candidate is ASTRAI_API_KEY" {
+    const candidates = providerEnvCandidates("astrai");
+    try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
 }
 
 test {

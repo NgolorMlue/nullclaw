@@ -22,9 +22,9 @@ pub const NoneMemory = struct {
         return "none";
     }
 
-    fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory) anyerror!void {}
+    fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
 
-    fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize) anyerror![]MemoryEntry {
+    fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
         return allocator.alloc(MemoryEntry, 0);
     }
 
@@ -32,7 +32,7 @@ pub const NoneMemory = struct {
         return null;
     }
 
-    fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory) anyerror![]MemoryEntry {
+    fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
         return allocator.alloc(MemoryEntry, 0);
     }
 
@@ -79,16 +79,16 @@ test "none memory is noop" {
 
     try std.testing.expectEqualStrings("none", m.name());
 
-    try m.store("k", "v", .core);
+    try m.store("k", "v", .core, null);
 
     const got = try m.get(std.testing.allocator, "k");
     try std.testing.expect(got == null);
 
-    const recalled = try m.recall(std.testing.allocator, "k", 10);
+    const recalled = try m.recall(std.testing.allocator, "k", 10, null);
     defer std.testing.allocator.free(recalled);
     try std.testing.expectEqual(@as(usize, 0), recalled.len);
 
-    const listed = try m.list(std.testing.allocator, null);
+    const listed = try m.list(std.testing.allocator, null, null);
     defer std.testing.allocator.free(listed);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
 
@@ -105,8 +105,8 @@ test "none memory count always zero" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "b", .core);
-    try m.store("c", "d", .daily);
+    try m.store("a", "b", .core, null);
+    try m.store("c", "d", .daily, null);
 
     try std.testing.expectEqual(@as(usize, 0), try m.count());
 }
@@ -116,13 +116,13 @@ test "none memory list always empty" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("key", "value", .core);
+    try m.store("key", "value", .core, null);
 
-    const core_list = try m.list(std.testing.allocator, .core);
+    const core_list = try m.list(std.testing.allocator, .core, null);
     defer std.testing.allocator.free(core_list);
     try std.testing.expectEqual(@as(usize, 0), core_list.len);
 
-    const all_list = try m.list(std.testing.allocator, null);
+    const all_list = try m.list(std.testing.allocator, null, null);
     defer std.testing.allocator.free(all_list);
     try std.testing.expectEqual(@as(usize, 0), all_list.len);
 }
@@ -132,9 +132,9 @@ test "none memory recall always empty" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("searchable", "find me", .core);
+    try m.store("searchable", "find me", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "find", 10);
+    const results = try m.recall(std.testing.allocator, "find", 10, null);
     defer std.testing.allocator.free(results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -144,8 +144,27 @@ test "none memory get always null" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("existing", "value", .core);
+    try m.store("existing", "value", .core, null);
 
     const result = try m.get(std.testing.allocator, "existing");
     try std.testing.expect(result == null);
+}
+
+test "none memory accepts session_id param" {
+    var mem = NoneMemory.init();
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store with session_id
+    try m.store("k", "v", .core, "session-123");
+
+    // Recall with session_id
+    const recalled = try m.recall(std.testing.allocator, "k", 10, "session-123");
+    defer std.testing.allocator.free(recalled);
+    try std.testing.expectEqual(@as(usize, 0), recalled.len);
+
+    // List with session_id
+    const listed = try m.list(std.testing.allocator, null, "session-123");
+    defer std.testing.allocator.free(listed);
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
 }

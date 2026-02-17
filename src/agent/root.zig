@@ -273,7 +273,7 @@ pub const Agent = struct {
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    mem.store(key, user_message, .conversation) catch {};
+                    mem.store(key, user_message, .conversation, null) catch {};
                 }
             }
         }
@@ -445,7 +445,7 @@ pub const Agent = struct {
                         const ts = @as(u64, @intCast(std.time.timestamp()));
                         const save_key = try std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts});
                         defer self.allocator.free(save_key);
-                        mem.store(save_key, summary, .daily) catch {};
+                        mem.store(save_key, summary, .daily, null) catch {};
                     }
                 }
 

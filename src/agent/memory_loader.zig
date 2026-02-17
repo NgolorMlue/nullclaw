@@ -25,7 +25,7 @@ pub fn loadContext(
     mem: Memory,
     user_message: []const u8,
 ) ![]const u8 {
-    const entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT) catch {
+    const entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, null) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.freeEntries(allocator, entries);

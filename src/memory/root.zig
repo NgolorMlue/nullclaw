@@ -113,10 +113,10 @@ pub const Memory = struct {
 
     pub const VTable = struct {
         name: *const fn (ptr: *anyopaque) []const u8,
-        store: *const fn (ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory) anyerror!void,
-        recall: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize) anyerror![]MemoryEntry,
+        store: *const fn (ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void,
+        recall: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry,
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry,
-        list: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory) anyerror![]MemoryEntry,
+        list: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry,
         forget: *const fn (ptr: *anyopaque, key: []const u8) anyerror!bool,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
@@ -127,20 +127,20 @@ pub const Memory = struct {
         return self.vtable.name(self.ptr);
     }
 
-    pub fn store(self: Memory, key: []const u8, content: []const u8, category: MemoryCategory) !void {
-        return self.vtable.store(self.ptr, key, content, category);
+    pub fn store(self: Memory, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) !void {
+        return self.vtable.store(self.ptr, key, content, category, session_id);
     }
 
-    pub fn recall(self: Memory, allocator: std.mem.Allocator, query: []const u8, limit: usize) ![]MemoryEntry {
-        return self.vtable.recall(self.ptr, allocator, query, limit);
+    pub fn recall(self: Memory, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
+        return self.vtable.recall(self.ptr, allocator, query, limit, session_id);
     }
 
     pub fn get(self: Memory, allocator: std.mem.Allocator, key: []const u8) !?MemoryEntry {
         return self.vtable.get(self.ptr, allocator, key);
     }
 
-    pub fn list(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory) ![]MemoryEntry {
-        return self.vtable.list(self.ptr, allocator, category);
+    pub fn list(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) ![]MemoryEntry {
+        return self.vtable.list(self.ptr, allocator, category, session_id);
     }
 
     pub fn forget(self: Memory, key: []const u8) !bool {
@@ -167,7 +167,7 @@ pub const Memory = struct {
         // For now, delegate to recall() which uses FTS5/keyword search.
         // When embeddings are integrated at a higher level, this serves as
         // the standard entry point that can be upgraded to hybrid search.
-        return self.recall(allocator, query, limit);
+        return self.recall(allocator, query, limit, null);
     }
 };
 
@@ -375,6 +375,40 @@ test "selectable backends none has no auto save" {
     try std.testing.expect(!selectable_backends[3].auto_save_default);
     try std.testing.expect(!selectable_backends[3].sqlite_based);
     try std.testing.expect(!selectable_backends[3].uses_sqlite_hygiene);
+}
+
+test "Memory convenience store accepts session_id" {
+    var backend = none.NoneMemory.init();
+    defer backend.deinit();
+    const m = backend.memory();
+    try m.store("key", "value", .core, null);
+    try m.store("key2", "value2", .daily, "session-abc");
+}
+
+test "Memory convenience recall accepts session_id" {
+    var backend = none.NoneMemory.init();
+    defer backend.deinit();
+    const m = backend.memory();
+    const results = try m.recall(std.testing.allocator, "query", 5, null);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+
+    const results2 = try m.recall(std.testing.allocator, "query", 5, "session-abc");
+    defer std.testing.allocator.free(results2);
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
+}
+
+test "Memory convenience list accepts session_id" {
+    var backend = none.NoneMemory.init();
+    defer backend.deinit();
+    const m = backend.memory();
+    const results = try m.list(std.testing.allocator, null, null);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+
+    const results2 = try m.list(std.testing.allocator, .core, "session-abc");
+    defer std.testing.allocator.free(results2);
+    try std.testing.expectEqual(@as(usize, 0), results2.len);
 }
 
 test {

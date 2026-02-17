@@ -5,6 +5,7 @@
 //! - FTS5 full-text search with BM25 scoring
 //! - FTS5 sync triggers (insert/update/delete)
 //! - Upsert semantics (ON CONFLICT DO UPDATE)
+//! - Session-scoped memory isolation via session_id
 //! - Session message storage (legacy compat)
 //! - KV store for settings
 
@@ -37,6 +38,7 @@ pub const SqliteMemory = struct {
         var self_ = Self{ .db = db, .allocator = allocator };
         try self_.configurePragmas();
         try self_.migrate();
+        try self_.migrateSessionId();
         return self_;
     }
 
@@ -70,11 +72,13 @@ pub const SqliteMemory = struct {
             \\  key        TEXT NOT NULL UNIQUE,
             \\  content    TEXT NOT NULL,
             \\  category   TEXT NOT NULL DEFAULT 'core',
+            \\  session_id TEXT,
             \\  created_at TEXT NOT NULL,
             \\  updated_at TEXT NOT NULL
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+            \\CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
             \\
             \\-- FTS5 full-text search (BM25 scoring)
             \\CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -140,13 +144,42 @@ pub const SqliteMemory = struct {
         }
     }
 
+    /// Migration: add session_id column to existing databases that lack it.
+    /// Safe to run repeatedly — ALTER TABLE fails gracefully if column already exists.
+    pub fn migrateSessionId(self: *Self) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(
+            self.db,
+            "ALTER TABLE memories ADD COLUMN session_id TEXT;",
+            null,
+            null,
+            &err_msg,
+        );
+        if (rc != c.SQLITE_OK) {
+            // "duplicate column name" is expected on databases that already have the column
+            if (err_msg) |msg| c.sqlite3_free(msg);
+        }
+        // Ensure index exists regardless
+        var err_msg2: [*c]u8 = null;
+        const rc2 = c.sqlite3_exec(
+            self.db,
+            "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+            null,
+            null,
+            &err_msg2,
+        );
+        if (rc2 != c.SQLITE_OK) {
+            if (err_msg2) |msg| c.sqlite3_free(msg);
+        }
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
         return "sqlite";
     }
 
-    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory) anyerror!void {
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
@@ -157,11 +190,12 @@ pub const SqliteMemory = struct {
 
         const cat_str = category.toString();
 
-        const sql = "INSERT INTO memories (id, key, content, category, created_at, updated_at) " ++
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6) " ++
+        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
             "ON CONFLICT(key) DO UPDATE SET " ++
             "content = excluded.content, " ++
             "category = excluded.category, " ++
+            "session_id = excluded.session_id, " ++
             "updated_at = excluded.updated_at";
 
         var stmt: ?*c.sqlite3_stmt = null;
@@ -173,30 +207,35 @@ pub const SqliteMemory = struct {
         _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 4, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 5, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 5, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 5);
+        }
         _ = c.sqlite3_bind_text(stmt, 6, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 7, now.ptr, @intCast(now.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
-    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize) anyerror![]MemoryEntry {
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const trimmed = std.mem.trim(u8, query, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
-        const results = try fts5Search(self_, allocator, trimmed, limit);
+        const results = try fts5Search(self_, allocator, trimmed, limit, session_id);
         if (results.len > 0) return results;
 
         allocator.free(results);
-        return try likeSearch(self_, allocator, trimmed, limit);
+        return try likeSearch(self_, allocator, trimmed, limit, session_id);
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const sql = "SELECT id, key, content, category, created_at FROM memories WHERE key = ?1";
+        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -211,7 +250,7 @@ pub const SqliteMemory = struct {
         return null;
     }
 
-    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory) anyerror![]MemoryEntry {
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
@@ -222,7 +261,7 @@ pub const SqliteMemory = struct {
 
         if (category) |cat| {
             const cat_str = cat.toString();
-            const sql = "SELECT id, key, content, category, created_at FROM memories " ++
+            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories " ++
                 "WHERE category = ?1 ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -234,11 +273,18 @@ pub const SqliteMemory = struct {
             while (true) {
                 rc = c.sqlite3_step(stmt);
                 if (rc == c.SQLITE_ROW) {
-                    try entries.append(allocator, try readEntryFromRow(stmt.?, allocator));
+                    const entry = try readEntryFromRow(stmt.?, allocator);
+                    if (session_id) |sid| {
+                        if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
+                            entry.deinit(allocator);
+                            continue;
+                        }
+                    }
+                    try entries.append(allocator, entry);
                 } else break;
             }
         } else {
-            const sql = "SELECT id, key, content, category, created_at FROM memories ORDER BY updated_at DESC";
+            const sql = "SELECT id, key, content, category, created_at, session_id FROM memories ORDER BY updated_at DESC";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -247,7 +293,14 @@ pub const SqliteMemory = struct {
             while (true) {
                 rc = c.sqlite3_step(stmt);
                 if (rc == c.SQLITE_ROW) {
-                    try entries.append(allocator, try readEntryFromRow(stmt.?, allocator));
+                    const entry = try readEntryFromRow(stmt.?, allocator);
+                    if (session_id) |sid| {
+                        if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
+                            entry.deinit(allocator);
+                            continue;
+                        }
+                    }
+                    try entries.append(allocator, entry);
                 } else break;
             }
         }
@@ -354,7 +407,7 @@ pub const SqliteMemory = struct {
 
     // ── Internal search helpers ────────────────────────────────────
 
-    fn fts5Search(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize) ![]MemoryEntry {
+    fn fts5Search(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
         // Build FTS5 query: wrap each word in quotes joined by OR
         var fts_query: std.ArrayList(u8) = .empty;
         defer fts_query.deinit(allocator);
@@ -380,7 +433,7 @@ pub const SqliteMemory = struct {
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         const sql =
-            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score " ++
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
             "FROM memories_fts f " ++
             "JOIN memories m ON m.rowid = f.rowid " ++
             "WHERE memories_fts MATCH ?1 " ++
@@ -410,6 +463,13 @@ pub const SqliteMemory = struct {
                 const score_raw = c.sqlite3_column_double(stmt.?, 5);
                 var entry = try readEntryFromRow(stmt.?, allocator);
                 entry.score = -score_raw; // BM25 returns negative (lower = better)
+                // Filter by session_id if requested
+                if (session_id) |sid| {
+                    if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
+                        entry.deinit(allocator);
+                        continue;
+                    }
+                }
                 try entries.append(allocator, entry);
             } else break;
         }
@@ -417,7 +477,7 @@ pub const SqliteMemory = struct {
         return entries.toOwnedSlice(allocator);
     }
 
-    fn likeSearch(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize) ![]MemoryEntry {
+    fn likeSearch(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
         var keywords: std.ArrayList([]const u8) = .empty;
         defer keywords.deinit(allocator);
 
@@ -431,7 +491,7 @@ pub const SqliteMemory = struct {
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
 
-        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at FROM memories WHERE ");
+        try sql_buf.appendSlice(allocator, "SELECT id, key, content, category, created_at, session_id FROM memories WHERE ");
 
         for (keywords.items, 0..) |_, i| {
             if (i > 0) try sql_buf.appendSlice(allocator, " OR ");
@@ -476,6 +536,13 @@ pub const SqliteMemory = struct {
             if (rc == c.SQLITE_ROW) {
                 var entry = try readEntryFromRow(stmt.?, allocator);
                 entry.score = 1.0;
+                // Filter by session_id if requested
+                if (session_id) |sid| {
+                    if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
+                        entry.deinit(allocator);
+                        continue;
+                    }
+                }
                 try entries.append(allocator, entry);
             } else break;
         }
@@ -495,6 +562,8 @@ pub const SqliteMemory = struct {
         const cat_str = try dupeColumnText(stmt, 3, allocator);
         const timestamp = try dupeColumnText(stmt, 4, allocator);
         errdefer allocator.free(timestamp);
+        const sid = try dupeColumnTextNullable(stmt, 5, allocator);
+        errdefer if (sid) |s| allocator.free(s);
 
         const category = blk: {
             if (std.mem.eql(u8, cat_str, "core")) {
@@ -517,7 +586,7 @@ pub const SqliteMemory = struct {
             .content = content,
             .category = category,
             .timestamp = timestamp,
-            .session_id = null,
+            .session_id = sid,
             .score = null,
         };
     }
@@ -530,6 +599,20 @@ pub const SqliteMemory = struct {
         }
         const slice: []const u8 = @as([*]const u8, @ptrCast(raw))[0..len];
         return allocator.dupe(u8, slice);
+    }
+
+    /// Like dupeColumnText but returns null when the column value is SQL NULL.
+    fn dupeColumnTextNullable(stmt: *c.sqlite3_stmt, col: c_int, allocator: std.mem.Allocator) !?[]u8 {
+        if (c.sqlite3_column_type(stmt, col) == c.SQLITE_NULL) {
+            return null;
+        }
+        const raw = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+        if (raw == null) {
+            return null;
+        }
+        const slice: []const u8 = @as([*]const u8, @ptrCast(raw))[0..len];
+        return try allocator.dupe(u8, slice);
     }
 
     fn appendInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
@@ -580,7 +663,7 @@ test "sqlite store and get" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("user_lang", "Prefers Zig", .core);
+    try m.store("user_lang", "Prefers Zig", .core, null);
 
     const entry = try m.get(std.testing.allocator, "user_lang");
     try std.testing.expect(entry != null);
@@ -596,8 +679,8 @@ test "sqlite store upsert" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("pref", "likes Zig", .core);
-    try m.store("pref", "loves Zig", .core);
+    try m.store("pref", "likes Zig", .core, null);
+    try m.store("pref", "loves Zig", .core, null);
 
     const entry = try m.get(std.testing.allocator, "pref");
     try std.testing.expect(entry != null);
@@ -613,11 +696,11 @@ test "sqlite recall keyword" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "Zig is fast and safe", .core);
-    try m.store("b", "Python is interpreted", .core);
-    try m.store("c", "Zig has comptime", .core);
+    try m.store("a", "Zig is fast and safe", .core, null);
+    try m.store("b", "Python is interpreted", .core, null);
+    try m.store("c", "Zig has comptime", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "Zig", 10);
+    const results = try m.recall(std.testing.allocator, "Zig", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -631,9 +714,9 @@ test "sqlite recall no match" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "Zig rocks", .core);
+    try m.store("a", "Zig rocks", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "javascript", 10);
+    const results = try m.recall(std.testing.allocator, "javascript", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expectEqual(@as(usize, 0), results.len);
@@ -644,9 +727,9 @@ test "sqlite recall empty query" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "data", .core);
+    try m.store("a", "data", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "", 10);
+    const results = try m.recall(std.testing.allocator, "", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -656,9 +739,9 @@ test "sqlite recall whitespace query" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "data", .core);
+    try m.store("a", "data", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "   ", 10);
+    const results = try m.recall(std.testing.allocator, "   ", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -668,7 +751,7 @@ test "sqlite forget" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("temp", "temporary data", .conversation);
+    try m.store("temp", "temporary data", .conversation, null);
     try std.testing.expectEqual(@as(usize, 1), try m.count());
 
     const removed = try m.forget("temp");
@@ -690,11 +773,11 @@ test "sqlite list all" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "one", .core);
-    try m.store("b", "two", .daily);
-    try m.store("c", "three", .conversation);
+    try m.store("a", "one", .core, null);
+    try m.store("b", "two", .daily, null);
+    try m.store("c", "three", .conversation, null);
 
-    const all = try m.list(std.testing.allocator, null);
+    const all = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, all);
     try std.testing.expectEqual(@as(usize, 3), all.len);
 }
@@ -704,15 +787,15 @@ test "sqlite list by category" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "core1", .core);
-    try m.store("b", "core2", .core);
-    try m.store("c", "daily1", .daily);
+    try m.store("a", "core1", .core, null);
+    try m.store("b", "core2", .core, null);
+    try m.store("c", "daily1", .daily, null);
 
-    const core_list = try m.list(std.testing.allocator, .core);
+    const core_list = try m.list(std.testing.allocator, .core, null);
     defer root.freeEntries(std.testing.allocator, core_list);
     try std.testing.expectEqual(@as(usize, 2), core_list.len);
 
-    const daily_list = try m.list(std.testing.allocator, .daily);
+    const daily_list = try m.list(std.testing.allocator, .daily, null);
     defer root.freeEntries(std.testing.allocator, daily_list);
     try std.testing.expectEqual(@as(usize, 1), daily_list.len);
 }
@@ -738,10 +821,10 @@ test "sqlite category roundtrip" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("k0", "v0", .core);
-    try m.store("k1", "v1", .daily);
-    try m.store("k2", "v2", .conversation);
-    try m.store("k3", "v3", .{ .custom = "project" });
+    try m.store("k0", "v0", .core, null);
+    try m.store("k1", "v1", .daily, null);
+    try m.store("k2", "v2", .conversation, null);
+    try m.store("k3", "v3", .{ .custom = "project" }, null);
 
     const e0 = (try m.get(std.testing.allocator, "k0")).?;
     defer e0.deinit(std.testing.allocator);
@@ -765,10 +848,10 @@ test "sqlite forget then recall no ghost results" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("ghost", "phantom memory content", .core);
+    try m.store("ghost", "phantom memory content", .core, null);
     _ = try m.forget("ghost");
 
-    const results = try m.recall(std.testing.allocator, "phantom memory", 10);
+    const results = try m.recall(std.testing.allocator, "phantom memory", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
 }
@@ -778,9 +861,9 @@ test "sqlite forget and re-store same key" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("cycle", "version 1", .core);
+    try m.store("cycle", "version 1", .core, null);
     _ = try m.forget("cycle");
-    try m.store("cycle", "version 2", .core);
+    try m.store("cycle", "version 2", .core, null);
 
     const entry = (try m.get(std.testing.allocator, "cycle")).?;
     defer entry.deinit(std.testing.allocator);
@@ -793,7 +876,7 @@ test "sqlite store empty content" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("empty", "", .core);
+    try m.store("empty", "", .core, null);
     const entry = (try m.get(std.testing.allocator, "empty")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", entry.content);
@@ -804,7 +887,7 @@ test "sqlite store empty key" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("", "content for empty key", .core);
+    try m.store("", "content for empty key", .core, null);
     const entry = (try m.get(std.testing.allocator, "")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("content for empty key", entry.content);
@@ -815,9 +898,9 @@ test "sqlite recall results have scores" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("s1", "scored result test", .core);
+    try m.store("s1", "scored result test", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "scored", 10);
+    const results = try m.recall(std.testing.allocator, "scored", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len > 0);
@@ -831,12 +914,12 @@ test "sqlite reindex" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("r1", "reindex test alpha", .core);
-    try m.store("r2", "reindex test beta", .core);
+    try m.store("r1", "reindex test alpha", .core, null);
+    try m.store("r2", "reindex test beta", .core, null);
 
     try mem.reindex();
 
-    const results = try m.recall(std.testing.allocator, "reindex", 10);
+    const results = try m.recall(std.testing.allocator, "reindex", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 2), results.len);
 }
@@ -846,9 +929,9 @@ test "sqlite recall with sql injection attempt" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("safe", "normal content", .core);
+    try m.store("safe", "normal content", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "'; DROP TABLE memories; --", 10);
+    const results = try m.recall(std.testing.allocator, "'; DROP TABLE memories; --", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expectEqual(@as(usize, 1), try m.count());
@@ -875,7 +958,7 @@ test "sqlite fts5 syncs on insert" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("test_key", "unique_searchterm_xyz", .core);
+    try m.store("test_key", "unique_searchterm_xyz", .core, null);
 
     const sql = "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"unique_searchterm_xyz\"'";
     var stmt: ?*c.sqlite3_stmt = null;
@@ -893,7 +976,7 @@ test "sqlite fts5 syncs on delete" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("del_key", "deletable_content_abc", .core);
+    try m.store("del_key", "deletable_content_abc", .core, null);
     _ = try m.forget("del_key");
 
     const sql = "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"deletable_content_abc\"'";
@@ -912,8 +995,8 @@ test "sqlite fts5 syncs on update" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("upd_key", "original_content_111", .core);
-    try m.store("upd_key", "updated_content_222", .core);
+    try m.store("upd_key", "original_content_111", .core, null);
+    try m.store("upd_key", "updated_content_222", .core, null);
 
     {
         const sql = "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"original_content_111\"'";
@@ -943,11 +1026,11 @@ test "sqlite list custom category" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("c1", "custom1", .{ .custom = "project" });
-    try m.store("c2", "custom2", .{ .custom = "project" });
-    try m.store("c3", "other", .core);
+    try m.store("c1", "custom1", .{ .custom = "project" }, null);
+    try m.store("c2", "custom2", .{ .custom = "project" }, null);
+    try m.store("c3", "other", .core, null);
 
-    const project = try m.list(std.testing.allocator, .{ .custom = "project" });
+    const project = try m.list(std.testing.allocator, .{ .custom = "project" }, null);
     defer root.freeEntries(std.testing.allocator, project);
     try std.testing.expectEqual(@as(usize, 2), project.len);
 }
@@ -957,7 +1040,7 @@ test "sqlite list empty db" {
     defer mem.deinit();
     const m = mem.memory();
 
-    const all = try m.list(std.testing.allocator, null);
+    const all = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, all);
     try std.testing.expectEqual(@as(usize, 0), all.len);
 }
@@ -967,9 +1050,9 @@ test "sqlite recall matches by key not just content" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("zig_preferences", "User likes systems programming", .core);
+    try m.store("zig_preferences", "User likes systems programming", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "zig", 10);
+    const results = try m.recall(std.testing.allocator, "zig", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len > 0);
@@ -985,10 +1068,10 @@ test "sqlite recall respects limit" {
         const key = std.fmt.bufPrint(&key_buf, "key_{d}", .{i}) catch continue;
         var content_buf: [64]u8 = undefined;
         const content = std.fmt.bufPrint(&content_buf, "searchable content number {d}", .{i}) catch continue;
-        try m.store(key, content, .core);
+        try m.store(key, content, .core, null);
     }
 
-    const results = try m.recall(std.testing.allocator, "searchable", 3);
+    const results = try m.recall(std.testing.allocator, "searchable", 3, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len <= 3);
@@ -999,7 +1082,7 @@ test "sqlite store unicode content" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("unicode_key", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88", .core);
+    try m.store("unicode_key", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88", .core, null);
 
     const entry = (try m.get(std.testing.allocator, "unicode_key")).?;
     defer entry.deinit(std.testing.allocator);
@@ -1011,9 +1094,9 @@ test "sqlite recall unicode query" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("jp", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88", .core);
+    try m.store("jp", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", 10);
+    const results = try m.recall(std.testing.allocator, "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len > 0);
@@ -1031,7 +1114,7 @@ test "sqlite store long content" {
         try buf.appendSlice(std.testing.allocator, "abcdefghij");
     }
 
-    try m.store("long", buf.items, .core);
+    try m.store("long", buf.items, .core, null);
     const entry = (try m.get(std.testing.allocator, "long")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 10000), entry.content.len);
@@ -1042,10 +1125,10 @@ test "sqlite multiple categories count" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("a", "one", .core);
-    try m.store("b", "two", .daily);
-    try m.store("c", "three", .conversation);
-    try m.store("d", "four", .{ .custom = "project" });
+    try m.store("a", "one", .core, null);
+    try m.store("b", "two", .daily, null);
+    try m.store("c", "three", .conversation, null);
+    try m.store("d", "four", .{ .custom = "project" }, null);
 
     try std.testing.expectEqual(@as(usize, 4), try m.count());
 }
@@ -1075,9 +1158,9 @@ test "sqlite store and forget multiple keys" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("k1", "v1", .core);
-    try m.store("k2", "v2", .core);
-    try m.store("k3", "v3", .core);
+    try m.store("k1", "v1", .core, null);
+    try m.store("k2", "v2", .core, null);
+    try m.store("k3", "v3", .core, null);
 
     try std.testing.expectEqual(@as(usize, 3), try m.count());
 
@@ -1094,8 +1177,8 @@ test "sqlite upsert changes category" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("key", "value", .core);
-    try m.store("key", "new value", .daily);
+    try m.store("key", "value", .core, null);
+    try m.store("key", "new value", .daily, null);
 
     const entry = (try m.get(std.testing.allocator, "key")).?;
     defer entry.deinit(std.testing.allocator);
@@ -1108,11 +1191,11 @@ test "sqlite recall multi-word query" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("zig-lang", "Zig is a systems programming language", .core);
-    try m.store("rust-lang", "Rust is also a systems language", .core);
-    try m.store("python-lang", "Python is interpreted", .core);
+    try m.store("zig-lang", "Zig is a systems programming language", .core, null);
+    try m.store("rust-lang", "Rust is also a systems language", .core, null);
+    try m.store("python-lang", "Python is interpreted", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "systems programming", 10);
+    const results = try m.recall(std.testing.allocator, "systems programming", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len >= 1);
@@ -1123,11 +1206,11 @@ test "sqlite list returns all entries" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("first", "first entry", .core);
-    try m.store("second", "second entry", .core);
-    try m.store("third", "third entry", .core);
+    try m.store("first", "first entry", .core, null);
+    try m.store("second", "second entry", .core, null);
+    try m.store("third", "third entry", .core, null);
 
-    const all = try m.list(std.testing.allocator, null);
+    const all = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, all);
 
     try std.testing.expectEqual(@as(usize, 3), all.len);
@@ -1151,7 +1234,7 @@ test "sqlite get returns entry with all fields" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("test_key", "test_content", .daily);
+    try m.store("test_key", "test_content", .daily, null);
 
     const entry = (try m.get(std.testing.allocator, "test_key")).?;
     defer entry.deinit(std.testing.allocator);
@@ -1168,9 +1251,9 @@ test "sqlite recall with quotes in query" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("quotes", "He said \"hello\" to the world", .core);
+    try m.store("quotes", "He said \"hello\" to the world", .core, null);
 
-    const results = try m.recall(std.testing.allocator, "hello", 10);
+    const results = try m.recall(std.testing.allocator, "hello", 10, null);
     defer root.freeEntries(std.testing.allocator, results);
 
     try std.testing.expect(results.len > 0);
@@ -1181,7 +1264,7 @@ test "sqlite health check after operations" {
     defer mem.deinit();
     const m = mem.memory();
 
-    try m.store("k", "v", .core);
+    try m.store("k", "v", .core, null);
     _ = try m.forget("k");
 
     try std.testing.expect(m.healthCheck());
@@ -1200,4 +1283,151 @@ test "sqlite kv table exists" {
     rc = c.sqlite3_step(stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, rc);
     try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+}
+
+// ── Session ID tests ──────────────────────────────────────────────
+
+test "sqlite store with session_id persists" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "session data", .core, "sess-abc");
+
+    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    defer entry.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("session data", entry.content);
+    try std.testing.expect(entry.session_id != null);
+    try std.testing.expectEqualStrings("sess-abc", entry.session_id.?);
+}
+
+test "sqlite store without session_id gives null" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "no session", .core, null);
+
+    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    defer entry.deinit(std.testing.allocator);
+
+    try std.testing.expect(entry.session_id == null);
+}
+
+test "sqlite recall with session_id filters correctly" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "session A fact", .core, "sess-a");
+    try m.store("k2", "session B fact", .core, "sess-b");
+    try m.store("k3", "no session fact", .core, null);
+
+    // Recall with session-a filter returns only session-a entry
+    const results = try m.recall(std.testing.allocator, "fact", 10, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("k1", results[0].key);
+    try std.testing.expect(results[0].session_id != null);
+    try std.testing.expectEqualStrings("sess-a", results[0].session_id.?);
+}
+
+test "sqlite recall with null session_id returns all" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "alpha fact", .core, "sess-a");
+    try m.store("k2", "beta fact", .core, "sess-b");
+    try m.store("k3", "gamma fact", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "fact", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+}
+
+test "sqlite list with session_id filter" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "a1", .core, "sess-a");
+    try m.store("k2", "a2", .conversation, "sess-a");
+    try m.store("k3", "b1", .core, "sess-b");
+    try m.store("k4", "none1", .core, null);
+
+    // List with session-a filter
+    const results = try m.list(std.testing.allocator, null, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |entry| {
+        try std.testing.expect(entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+    }
+}
+
+test "sqlite list with session_id and category filter" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("k1", "a1", .core, "sess-a");
+    try m.store("k2", "a2", .conversation, "sess-a");
+    try m.store("k3", "b1", .core, "sess-b");
+
+    const results = try m.list(std.testing.allocator, .core, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("k1", results[0].key);
+}
+
+test "sqlite cross-session recall isolation" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("secret", "session A secret data", .core, "sess-a");
+
+    // Session B cannot see session A data
+    const results_b = try m.recall(std.testing.allocator, "secret", 10, "sess-b");
+    defer root.freeEntries(std.testing.allocator, results_b);
+    try std.testing.expectEqual(@as(usize, 0), results_b.len);
+
+    // Session A can see its own data
+    const results_a = try m.recall(std.testing.allocator, "secret", 10, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results_a);
+    try std.testing.expectEqual(@as(usize, 1), results_a.len);
+}
+
+test "sqlite schema has session_id column" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    // Verify session_id column exists by querying it
+    const sql = "SELECT session_id FROM memories LIMIT 0";
+    var stmt: ?*c.sqlite3_stmt = null;
+    const rc = c.sqlite3_prepare_v2(mem.db, sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    _ = c.sqlite3_finalize(stmt);
+}
+
+test "sqlite schema migration is idempotent" {
+    // Calling migrateSessionId twice should not fail
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    // migrateSessionId already ran during init; call it again
+    try mem.migrateSessionId();
+
+    // Store with session_id should still work
+    const m = mem.memory();
+    try m.store("k1", "data", .core, "sess-x");
+    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sess-x", entry.session_id.?);
 }

@@ -42,9 +42,94 @@ pub const GitTool = struct {
         ;
     }
 
+    /// Returns false if the git arguments contain dangerous patterns.
+    fn sanitizeGitArgs(args: []const u8) bool {
+        // Block dangerous git options that could lead to command injection
+        const dangerous_prefixes = [_][]const u8{
+            "--exec=",
+            "--upload-pack=",
+            "--receive-pack=",
+            "--pager=",
+            "--editor=",
+        };
+        const dangerous_exact = [_][]const u8{
+            "--no-verify",
+        };
+        const dangerous_substrings = [_][]const u8{
+            "$(",
+            "`",
+        };
+        const dangerous_chars = [_]u8{ '|', ';', '>' };
+
+        var it = std.mem.tokenizeScalar(u8, args, ' ');
+        while (it.next()) |arg| {
+            // Check dangerous prefixes (case-insensitive via lowercase comparison)
+            for (dangerous_prefixes) |prefix| {
+                if (arg.len >= prefix.len and std.ascii.eqlIgnoreCase(arg[0..prefix.len], prefix))
+                    return false;
+            }
+            // Check exact matches (case-insensitive)
+            for (dangerous_exact) |exact| {
+                if (arg.len == exact.len and std.ascii.eqlIgnoreCase(arg, exact))
+                    return false;
+            }
+            // Check dangerous substrings
+            for (dangerous_substrings) |sub| {
+                if (std.mem.indexOf(u8, arg, sub) != null)
+                    return false;
+            }
+            // Check dangerous single characters
+            for (arg) |ch| {
+                for (dangerous_chars) |dc| {
+                    if (ch == dc) return false;
+                }
+            }
+            // Block -c config injection: exact "-c" or "-c=..." (but not "--cached", "-cached", etc.)
+            if (arg.len == 2 and arg[0] == '-' and (arg[1] == 'c' or arg[1] == 'C')) {
+                return false;
+            }
+            if (arg.len > 2 and arg[0] == '-' and (arg[1] == 'c' or arg[1] == 'C') and arg[2] == '=') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Truncate a commit message to max_bytes, respecting UTF-8 boundaries.
+    fn truncateCommitMessage(msg: []const u8, max_bytes: usize) []const u8 {
+        if (msg.len <= max_bytes) return msg;
+        var i = max_bytes;
+        while (i > 0 and (msg[i] & 0xC0) == 0x80) i -= 1;
+        return msg[0..i];
+    }
+
+    /// Returns true for operations that modify the repository.
+    fn requiresWriteAccess(operation: []const u8) bool {
+        const write_ops = [_][]const u8{
+            "commit",   "push",  "merge", "rebase", "reset",
+            "checkout", "add",   "rm",    "mv",     "tag",
+            "branch",   "clean",
+        };
+        for (write_ops) |op| {
+            if (std.mem.eql(u8, operation, op)) return true;
+        }
+        // "stash push" is write, but we check at the stash level
+        if (std.mem.eql(u8, operation, "stash")) return true;
+        return false;
+    }
+
     fn execute(self: *GitTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
         const operation = parseStringField(args_json, "operation") orelse
             return ToolResult.fail("Missing 'operation' parameter");
+
+        // Sanitize all string arguments before execution
+        const fields_to_check = [_][]const u8{ "message", "paths", "branch", "files", "action" };
+        for (fields_to_check) |field| {
+            if (parseStringField(args_json, field)) |val| {
+                if (!sanitizeGitArgs(val))
+                    return ToolResult.fail("Unsafe git arguments detected");
+            }
+        }
 
         if (std.mem.eql(u8, operation, "status")) return self.gitStatus(allocator);
         if (std.mem.eql(u8, operation, "diff")) return self.gitDiff(allocator, args_json);
@@ -154,10 +239,12 @@ pub const GitTool = struct {
     }
 
     fn gitCommit(self: *GitTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
-        const message = parseStringField(args_json, "message") orelse
+        const raw_message = parseStringField(args_json, "message") orelse
             return ToolResult.fail("Missing 'message' parameter for commit");
 
-        if (message.len == 0) return ToolResult.fail("Commit message cannot be empty");
+        if (raw_message.len == 0) return ToolResult.fail("Commit message cannot be empty");
+
+        const message = truncateCommitMessage(raw_message, 2000);
 
         const result = try self.runGit(allocator, &.{ "commit", "-m", message });
         defer allocator.free(result.stderr);
@@ -295,7 +382,8 @@ test "git checkout blocks injection" {
     const result = try t.execute(std.testing.allocator, "{\"operation\": \"checkout\", \"branch\": \"main; rm -rf /\"}");
     // error_msg is a static string from ToolResult.fail(), don't free it
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+    // Caught by sanitizeGitArgs in execute() before reaching gitCheckout
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
 }
 
 test "git commit missing message" {
@@ -320,4 +408,139 @@ test "git add missing paths" {
     const result = try t.execute(std.testing.allocator, "{\"operation\": \"add\"}");
     // error_msg is a static string from ToolResult.fail(), don't free it
     try std.testing.expect(!result.success);
+}
+
+// ── sanitizeGitArgs tests ───────────────────────────────────────────
+
+test "sanitizeGitArgs blocks --exec=cmd" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--exec=rm -rf /"));
+}
+
+test "sanitizeGitArgs blocks --upload-pack=evil" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--upload-pack=evil"));
+}
+
+test "sanitizeGitArgs blocks --no-verify" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--no-verify"));
+}
+
+test "sanitizeGitArgs blocks command substitution $()" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("$(evil)"));
+}
+
+test "sanitizeGitArgs blocks backtick" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("`malicious`"));
+}
+
+test "sanitizeGitArgs blocks pipe" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("arg | cat /etc/passwd"));
+}
+
+test "sanitizeGitArgs blocks semicolon" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("arg; rm -rf /"));
+}
+
+test "sanitizeGitArgs blocks redirect" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("file.txt > /tmp/out"));
+}
+
+test "sanitizeGitArgs blocks -c config injection" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("-c core.sshCommand=evil"));
+    try std.testing.expect(!GitTool.sanitizeGitArgs("-c=core.pager=less"));
+}
+
+test "sanitizeGitArgs blocks --pager and --editor" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--pager=less"));
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--editor=vim"));
+}
+
+test "sanitizeGitArgs blocks --receive-pack" {
+    try std.testing.expect(!GitTool.sanitizeGitArgs("--receive-pack=evil"));
+}
+
+test "sanitizeGitArgs allows --oneline" {
+    try std.testing.expect(GitTool.sanitizeGitArgs("--oneline"));
+}
+
+test "sanitizeGitArgs allows --stat" {
+    try std.testing.expect(GitTool.sanitizeGitArgs("--stat"));
+}
+
+test "sanitizeGitArgs allows safe branch names" {
+    try std.testing.expect(GitTool.sanitizeGitArgs("main"));
+    try std.testing.expect(GitTool.sanitizeGitArgs("feature/test-branch"));
+    try std.testing.expect(GitTool.sanitizeGitArgs("src/main.zig"));
+    try std.testing.expect(GitTool.sanitizeGitArgs("."));
+}
+
+test "sanitizeGitArgs allows --cached (not blocked by -c check)" {
+    try std.testing.expect(GitTool.sanitizeGitArgs("--cached"));
+    try std.testing.expect(GitTool.sanitizeGitArgs("-cached"));
+}
+
+// ── truncateCommitMessage tests ─────────────────────────────────────
+
+test "truncateCommitMessage short message unchanged" {
+    const msg = "short message";
+    try std.testing.expectEqualStrings(msg, GitTool.truncateCommitMessage(msg, 2000));
+}
+
+test "truncateCommitMessage truncates at UTF-8 boundary" {
+    // "Привет" in UTF-8 is 12 bytes (2 bytes per Cyrillic char)
+    const msg = "Привет мир!"; // 20 bytes
+    const truncated = GitTool.truncateCommitMessage(msg, 10);
+    // Should truncate to 10 bytes which is at a clean boundary (5 Cyrillic chars)
+    try std.testing.expect(truncated.len <= 10);
+    // Must not end in the middle of a multi-byte sequence
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncated));
+}
+
+test "truncateCommitMessage exact boundary" {
+    const msg = "hello";
+    try std.testing.expectEqualStrings("hello", GitTool.truncateCommitMessage(msg, 5));
+    try std.testing.expectEqualStrings("hello", GitTool.truncateCommitMessage(msg, 100));
+}
+
+// ── requiresWriteAccess tests ───────────────────────────────────────
+
+test "requiresWriteAccess returns true for commit" {
+    try std.testing.expect(GitTool.requiresWriteAccess("commit"));
+}
+
+test "requiresWriteAccess returns true for push" {
+    try std.testing.expect(GitTool.requiresWriteAccess("push"));
+}
+
+test "requiresWriteAccess returns true for add" {
+    try std.testing.expect(GitTool.requiresWriteAccess("add"));
+}
+
+test "requiresWriteAccess returns false for status" {
+    try std.testing.expect(!GitTool.requiresWriteAccess("status"));
+}
+
+test "requiresWriteAccess returns false for diff" {
+    try std.testing.expect(!GitTool.requiresWriteAccess("diff"));
+}
+
+test "requiresWriteAccess returns false for log" {
+    try std.testing.expect(!GitTool.requiresWriteAccess("log"));
+}
+
+// ── Integration: sanitizeGitArgs in execute ─────────────────────────
+
+test "git execute blocks unsafe args in message" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const result = try t.execute(std.testing.allocator, "{\"operation\": \"commit\", \"message\": \"$(evil)\"}");
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
+}
+
+test "git execute blocks unsafe args in paths" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const result = try t.execute(std.testing.allocator, "{\"operation\": \"add\", \"paths\": \"file.txt; rm -rf /\"}");
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
 }

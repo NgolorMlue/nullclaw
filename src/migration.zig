@@ -107,7 +107,7 @@ pub fn migrateOpenclaw(
         }
 
         const category = memory_root.MemoryCategory.fromString(entry.category);
-        mem.store(key, entry.content, category) catch {
+        mem.store(key, entry.content, category, null) catch {
             continue;
         };
         stats.imported += 1;

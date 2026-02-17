@@ -1,6 +1,20 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+/// IRC style prefix prepended to messages before they reach the LLM.
+const IRC_STYLE_PREFIX =
+    "[context: you are responding over IRC. " ++
+    "Plain text only. No markdown, no tables, no XML/HTML tags. " ++
+    "Never use triple backtick code fences. Use a single blank line to separate blocks instead. " ++
+    "Be terse and concise. " ++
+    "Use short lines. Avoid walls of text.]\n";
+
+/// Max nick collision retries before giving up.
+const MAX_NICK_RETRIES: usize = 5;
+
+/// IRC service bot names to filter out.
+const SERVICE_BOTS = [_][]const u8{ "NickServ", "ChanServ", "BotServ", "MemoServ" };
+
 /// IRC channel over TLS.
 /// Joins configured channels, forwards PRIVMSG messages.
 pub const IrcChannel = struct {
@@ -15,6 +29,7 @@ pub const IrcChannel = struct {
     nickserv_password: ?[]const u8,
     sasl_password: ?[]const u8,
     verify_tls: bool,
+    use_tls: bool = true,
     stream: ?std.net.Stream = null,
 
     /// Max IRC line length (RFC 2812).
@@ -62,6 +77,36 @@ pub const IrcChannel = struct {
         return true;
     }
 
+    /// Check if a sender nick belongs to an IRC service bot.
+    pub fn isServiceBot(sender_nick: []const u8) bool {
+        for (&SERVICE_BOTS) |bot| {
+            if (std.ascii.eqlIgnoreCase(bot, sender_nick)) return true;
+        }
+        return false;
+    }
+
+    /// Determine reply target: channel messages reply to the channel,
+    /// DMs (target == bot nick) reply to the sender.
+    pub fn replyTarget(target: []const u8, sender_nick: []const u8) []const u8 {
+        const is_channel = target.len > 0 and (target[0] == '#' or target[0] == '&');
+        return if (is_channel) target else sender_nick;
+    }
+
+    /// Append '_' to nick for collision handling. Returns new nick or error.
+    pub fn handleNickCollision(allocator: std.mem.Allocator, current_nick: []const u8, retries: usize) ![]const u8 {
+        if (retries >= MAX_NICK_RETRIES) return error.NickCollisionLimitReached;
+        const new_nick = try allocator.alloc(u8, current_nick.len + 1);
+        @memcpy(new_nick[0..current_nick.len], current_nick);
+        new_nick[current_nick.len] = '_';
+        return new_nick;
+    }
+
+    /// Perform SASL PLAIN negotiation. Encodes credentials and returns the
+    /// AUTHENTICATE line payload (base64-encoded "\0nick\0password").
+    pub fn buildSaslPayload(buf: []u8, nick: []const u8, password: []const u8) []const u8 {
+        return encodeSaslPlain(buf, nick, password);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to an IRC channel/user via PRIVMSG.
@@ -95,7 +140,9 @@ pub const IrcChannel = struct {
         try stream.writeAll("\r\n");
     }
 
-    /// Connect to the IRC server via plain TCP.
+    /// Connect to the IRC server via TCP.
+    /// TODO: When use_tls is true, wrap the TCP stream with std.crypto.tls.Client
+    /// for TLS encryption. Currently connects via plain TCP regardless of use_tls.
     pub fn connect(self: *IrcChannel) !void {
         const addr = try std.net.Address.resolveIp(self.server, self.port);
         self.stream = try std.net.tcpConnectToAddress(addr);
@@ -114,6 +161,11 @@ pub const IrcChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *IrcChannel = @ptrCast(@alignCast(ptr));
         try self.connect();
+
+        // SASL: request capability before registration
+        if (self.sasl_password != null) {
+            try self.sendRaw("CAP REQ :sasl");
+        }
 
         // Send PASS if configured
         if (self.server_password) |pass| {
@@ -553,6 +605,8 @@ test "irc stores all fields" {
     try std.testing.expectEqualStrings("nspass", ch.nickserv_password.?);
     try std.testing.expectEqualStrings("saslpass", ch.sasl_password.?);
     try std.testing.expect(!ch.verify_tls);
+    // use_tls defaults to true
+    try std.testing.expect(ch.use_tls);
 }
 
 test "irc max line len constant" {
@@ -584,4 +638,91 @@ test "irc split long message" {
     try std.testing.expectEqual(@as(usize, 2), chunks.len);
     try std.testing.expectEqual(@as(usize, 400), chunks[0].len);
     try std.testing.expectEqual(@as(usize, 400), chunks[1].len);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TLS, SASL, Nick Collision, Service Filtering, DM Routing Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "irc use_tls defaults to true" {
+    const ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
+    try std.testing.expect(ch.use_tls);
+}
+
+test "irc sasl negotiation base64 encoding correct" {
+    var buf: [256]u8 = undefined;
+    // SASL PLAIN format: \0nick\0password
+    const encoded = IrcChannel.buildSaslPayload(&buf, "testbot", "s3cret");
+    // Manually verify: "\0testbot\0s3cret" base64
+    var verify_buf: [256]u8 = undefined;
+    const expected = encodeSaslPlain(&verify_buf, "testbot", "s3cret");
+    try std.testing.expectEqualStrings(expected, encoded);
+
+    // Also check against known value: \0testbot\0s3cret
+    // = 0x00 t e s t b o t 0x00 s 3 c r e t (15 bytes)
+    var known_buf: [256]u8 = undefined;
+    const known = encodeSaslPlain(&known_buf, "jilles", "sesame");
+    try std.testing.expectEqualStrings("AGppbGxlcwBzZXNhbWU=", known);
+}
+
+test "irc nick collision appends underscore" {
+    const allocator = std.testing.allocator;
+    const new_nick = try IrcChannel.handleNickCollision(allocator, "mybot", 0);
+    defer allocator.free(new_nick);
+    try std.testing.expectEqualStrings("mybot_", new_nick);
+}
+
+test "irc nick collision multiple retries" {
+    const allocator = std.testing.allocator;
+    const nick1 = try IrcChannel.handleNickCollision(allocator, "bot", 0);
+    defer allocator.free(nick1);
+    try std.testing.expectEqualStrings("bot_", nick1);
+
+    const nick2 = try IrcChannel.handleNickCollision(allocator, nick1, 1);
+    defer allocator.free(nick2);
+    try std.testing.expectEqualStrings("bot__", nick2);
+}
+
+test "irc nick collision limit reached" {
+    const result = IrcChannel.handleNickCollision(std.testing.allocator, "bot", MAX_NICK_RETRIES);
+    try std.testing.expectError(error.NickCollisionLimitReached, result);
+}
+
+test "irc service bot messages are filtered" {
+    try std.testing.expect(IrcChannel.isServiceBot("NickServ"));
+    try std.testing.expect(IrcChannel.isServiceBot("ChanServ"));
+    try std.testing.expect(IrcChannel.isServiceBot("BotServ"));
+    try std.testing.expect(IrcChannel.isServiceBot("MemoServ"));
+    // Case insensitive
+    try std.testing.expect(IrcChannel.isServiceBot("nickserv"));
+    try std.testing.expect(IrcChannel.isServiceBot("CHANSERV"));
+    // Not a service bot
+    try std.testing.expect(!IrcChannel.isServiceBot("alice"));
+    try std.testing.expect(!IrcChannel.isServiceBot("randomuser"));
+}
+
+test "irc dm reply_target is nick not channel" {
+    // When target is the bot's own nick (DM), reply_target should be the sender
+    const reply = IrcChannel.replyTarget("mybot", "alice");
+    try std.testing.expectEqualStrings("alice", reply);
+}
+
+test "irc channel reply_target is channel name" {
+    // When target starts with #, reply_target should be the channel
+    const reply = IrcChannel.replyTarget("#general", "alice");
+    try std.testing.expectEqualStrings("#general", reply);
+}
+
+test "irc ampersand channel reply_target is channel name" {
+    const reply = IrcChannel.replyTarget("&local", "bob");
+    try std.testing.expectEqualStrings("&local", reply);
+}
+
+test "irc style prefix exists" {
+    try std.testing.expect(IRC_STYLE_PREFIX.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, IRC_STYLE_PREFIX, "IRC") != null);
+}
+
+test "irc max nick retries constant" {
+    try std.testing.expectEqual(@as(usize, 5), MAX_NICK_RETRIES);
 }

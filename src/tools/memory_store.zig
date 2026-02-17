@@ -58,7 +58,7 @@ pub const MemoryStoreTool = struct {
             return ToolResult{ .success = true, .output = msg };
         };
 
-        m.store(key, content, category) catch |err| {
+        m.store(key, content, category, null) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
             return ToolResult{ .success = false, .output = msg };
         };
