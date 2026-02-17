@@ -1,4 +1,5 @@
 const std = @import("std");
+const bus = @import("bus.zig");
 
 pub const JobType = enum {
     shell,
@@ -42,8 +43,31 @@ pub const Schedule = union(ScheduleKind) {
     every: struct { every_ms: u64 },
 };
 
+pub const DeliveryMode = enum {
+    none,
+    always,
+    on_error,
+    on_success,
+
+    pub fn asStr(self: DeliveryMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .always => "always",
+            .on_error => "on_error",
+            .on_success => "on_success",
+        };
+    }
+
+    pub fn parse(raw: []const u8) DeliveryMode {
+        if (std.ascii.eqlIgnoreCase(raw, "always")) return .always;
+        if (std.ascii.eqlIgnoreCase(raw, "on_error")) return .on_error;
+        if (std.ascii.eqlIgnoreCase(raw, "on_success")) return .on_success;
+        return .none;
+    }
+};
+
 pub const DeliveryConfig = struct {
-    mode: []const u8 = "none",
+    mode: DeliveryMode = .none,
     channel: ?[]const u8 = null,
     to: ?[]const u8 = null,
     best_effort: bool = true,
@@ -88,6 +112,7 @@ pub const CronJob = struct {
     delete_after_run: bool = false,
     created_at_s: i64 = 0,
     last_output: ?[]const u8 = null,
+    delivery: DeliveryConfig = .{},
 };
 
 /// Duration unit for "once" delay parsing.
@@ -191,6 +216,7 @@ pub const CronScheduler = struct {
             self.allocator.free(job.id);
             self.allocator.free(job.expression);
             self.allocator.free(job.command);
+            if (job.last_output) |o| self.allocator.free(o);
         }
         self.jobs.deinit(self.allocator);
     }
@@ -381,44 +407,152 @@ pub const CronScheduler = struct {
     }
 
     /// Main scheduler loop: check all jobs, execute due ones, sleep until next.
-    pub fn run(self: *CronScheduler, poll_secs: u64) void {
+    /// If `out_bus` is provided, job results are delivered to channels per delivery config.
+    pub fn run(self: *CronScheduler, poll_secs: u64, out_bus: ?*bus.Bus) void {
         if (!self.enabled) return;
 
         const poll_ns: u64 = poll_secs * std.time.ns_per_s;
 
         while (true) {
             const now = std.time.timestamp();
-            for (self.jobs.items) |*job| {
-                if (!job.paused and job.next_run_secs <= now) {
-                    // Execute the job command via child process
+            self.tick(now, out_bus);
+            std.Thread.sleep(poll_ns);
+        }
+    }
+
+    /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
+    /// Separated from `run` for testability.
+    pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) void {
+        // Collect indices of one-shot jobs to remove after iteration
+        var remove_indices: [64]usize = undefined;
+        var remove_count: usize = 0;
+
+        for (self.jobs.items, 0..) |*job, idx| {
+            if (job.paused or job.next_run_secs > now) continue;
+
+            switch (job.job_type) {
+                .shell => {
+                    // Execute shell command via child process
                     const result = std.process.Child.run(.{
                         .allocator = self.allocator,
                         .argv = &.{ "sh", "-c", job.command },
                     }) catch {
                         job.last_status = "error";
                         job.last_run_secs = now;
+                        job.last_output = null;
+                        // Deliver error notification
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b) catch {};
+                        }
                         continue;
                     };
-                    self.allocator.free(result.stdout);
-                    self.allocator.free(result.stderr);
+                    defer self.allocator.free(result.stderr);
 
+                    const success = (result.term == .Exited and result.term.Exited == 0);
                     job.last_run_secs = now;
-                    job.last_status = if (result.term == .Exited and result.term.Exited == 0) "ok" else "error";
+                    job.last_status = if (success) "ok" else "error";
 
-                    if (job.one_shot) {
-                        // Mark for removal (set next_run far in the future; actual removal in next sweep)
-                        job.paused = true;
-                    } else {
-                        // Reschedule: advance by 60s (simple approximation without full cron parser)
-                        job.next_run_secs = now + 60;
+                    // Store and deliver stdout
+                    if (job.last_output) |old| self.allocator.free(old);
+                    job.last_output = if (result.stdout.len > 0) result.stdout else blk: {
+                        self.allocator.free(result.stdout);
+                        break :blk null;
+                    };
+
+                    if (out_bus) |b| {
+                        const output = job.last_output orelse "";
+                        _ = deliverResult(self.allocator, job.delivery, output, success, b) catch {};
                     }
-                }
+                },
+                .agent => {
+                    // Agent jobs: use prompt or command as the agent input.
+                    // In the real runtime the agent turn produces a result;
+                    // here we record the prompt and treat it as the output placeholder.
+                    const agent_output = job.prompt orelse job.command;
+                    job.last_run_secs = now;
+                    job.last_status = "ok";
+
+                    if (job.last_output) |old| self.allocator.free(old);
+                    job.last_output = self.allocator.dupe(u8, agent_output) catch null;
+
+                    if (out_bus) |b| {
+                        _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                    }
+                },
             }
 
-            std.Thread.sleep(poll_ns);
+            if (job.one_shot or job.delete_after_run) {
+                if (remove_count < remove_indices.len) {
+                    remove_indices[remove_count] = idx;
+                    remove_count += 1;
+                } else {
+                    // Fallback: just pause it
+                    job.paused = true;
+                }
+            } else {
+                // Reschedule: advance by 60s (simple approximation without full cron parser)
+                job.next_run_secs = now + 60;
+            }
+        }
+
+        // Remove one-shot jobs in reverse order to keep indices valid
+        if (remove_count > 0) {
+            var i: usize = remove_count;
+            while (i > 0) {
+                i -= 1;
+                const rm_idx = remove_indices[i];
+                const job = self.jobs.items[rm_idx];
+                self.allocator.free(job.id);
+                self.allocator.free(job.expression);
+                self.allocator.free(job.command);
+                if (job.last_output) |o| self.allocator.free(o);
+                _ = self.jobs.orderedRemove(rm_idx);
+            }
         }
     }
 };
+
+// ── Delivery ─────────────────────────────────────────────────────
+
+/// Deliver a cron job result to a channel via the outbound bus.
+/// Returns true if a message was published, false if delivery was skipped.
+pub fn deliverResult(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    output: []const u8,
+    success: bool,
+    out_bus: *bus.Bus,
+) !bool {
+    // Skip if mode is none
+    if (delivery.mode == .none) return false;
+
+    // Skip if no channel configured
+    const channel = delivery.channel orelse return false;
+
+    // Check mode-specific conditions
+    switch (delivery.mode) {
+        .none => return false,
+        .on_success => if (!success) return false,
+        .on_error => if (success) return false,
+        .always => {},
+    }
+
+    // Skip empty output
+    if (output.len == 0) return false;
+
+    const chat_id = delivery.to orelse "default";
+    const msg = try bus.makeOutbound(allocator, channel, chat_id, output);
+    out_bus.publishOutbound(msg) catch |err| {
+        // If best_effort, swallow the error after cleaning up
+        if (delivery.best_effort) {
+            msg.deinit(allocator);
+            return false;
+        }
+        msg.deinit(allocator);
+        return err;
+    };
+    return true;
+}
 
 // ── JSON Persistence ─────────────────────────────────────────────
 
@@ -964,6 +1098,282 @@ test "addRun prunes history" {
     }
     const runs = scheduler.listRuns(id, 100);
     try std.testing.expect(runs.len <= 3);
+}
+
+// ── Delivery + Bus integration tests ────────────────────────────
+
+test "deliverResult creates correct OutboundMessage" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    // Consume and verify the message
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expectEqualStrings("job output here", msg.content);
+}
+
+test "deliverResult with mode none does nothing" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .none,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult with no channel does nothing" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = null,
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_success skips on failure" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_success,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_error skips on success" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_error,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_error delivers on failure" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_error,
+        .channel = "discord",
+        .to = "room42",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("room42", msg.chat_id);
+    try std.testing.expectEqualStrings("crash log", msg.content);
+}
+
+test "deliverResult uses default chat_id when to is null" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "webhook",
+        .to = null,
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("default", msg.chat_id);
+}
+
+test "deliverResult skips empty output" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult best_effort swallows closed bus error" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    test_bus.close(); // close before delivery
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat1",
+        .best_effort = true,
+    };
+
+    // Should not return error because best_effort is true
+    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
+    try std.testing.expect(!delivered);
+}
+
+test "one-shot job deleted after tick execution" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("1s", "echo oneshot");
+    // Verify job was created
+    try std.testing.expect(job.one_shot);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+
+    // Force the job to be due now
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Tick without bus — the shell command "echo oneshot" will actually run
+    scheduler.tick(std.time.timestamp(), null);
+
+    // One-shot job should have been removed
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "shell job delivers stdout via bus" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addJob("* * * * *", "echo hello_cron");
+    _ = job;
+
+    // Configure delivery
+    scheduler.jobs.items[0].delivery = .{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat99",
+    };
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    scheduler.tick(std.time.timestamp(), &test_bus);
+
+    // Verify delivery happened
+    try std.testing.expect(test_bus.outboundDepth() > 0);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat99", msg.chat_id);
+    // The content should contain "hello_cron" from the echo command
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "hello_cron") != null);
+}
+
+test "agent job delivers result via bus" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    // Create an agent-type job with a prompt
+    try scheduler.jobs.append(allocator, .{
+        .id = try allocator.dupe(u8, "agent-1"),
+        .expression = try allocator.dupe(u8, "* * * * *"),
+        .command = try allocator.dupe(u8, "summarize"),
+        .job_type = .agent,
+        .prompt = "Summarize today's news",
+        .next_run_secs = 0,
+        .delivery = .{
+            .mode = .always,
+            .channel = "discord",
+            .to = "general",
+        },
+    });
+
+    scheduler.tick(std.time.timestamp(), &test_bus);
+
+    // Verify delivery
+    try std.testing.expect(test_bus.outboundDepth() > 0);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("general", msg.chat_id);
+    try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+}
+
+test "DeliveryMode parse and asStr" {
+    try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("none"));
+    try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("always"));
+    try std.testing.expectEqual(DeliveryMode.on_error, DeliveryMode.parse("on_error"));
+    try std.testing.expectEqual(DeliveryMode.on_success, DeliveryMode.parse("on_success"));
+    try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("unknown"));
+    try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("ALWAYS"));
+
+    try std.testing.expectEqualStrings("none", DeliveryMode.none.asStr());
+    try std.testing.expectEqualStrings("always", DeliveryMode.always.asStr());
+    try std.testing.expectEqualStrings("on_error", DeliveryMode.on_error.asStr());
+    try std.testing.expectEqualStrings("on_success", DeliveryMode.on_success.asStr());
+}
+
+test "tick without bus still executes jobs" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo silent");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Tick with null bus — should not crash
+    scheduler.tick(std.time.timestamp(), null);
+
+    // Job should have been executed and rescheduled
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
 }
 
 test "cron module compiles" {}

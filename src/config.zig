@@ -460,7 +460,7 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
 
     /// Sync flat convenience fields from the nested sub-configs.
-    fn syncFlatFields(self: *Config) void {
+    pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;
         self.memory_backend = self.memory.backend;
         self.memory_auto_save = self.memory.auto_save;
@@ -1093,7 +1093,7 @@ pub const Config = struct {
     }
 
     /// Apply NULLCLAW_* environment variable overrides.
-    fn applyEnvOverrides(self: *Config) void {
+    pub fn applyEnvOverrides(self: *Config) void {
         // API Key
         if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_API_KEY")) |key| {
             self.api_key = key;
@@ -1141,6 +1141,11 @@ pub const Config = struct {
         if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_ALLOW_PUBLIC_BIND")) |val| {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else |_| {}
+
+        // Base URL (maps to api_url)
+        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_BASE_URL")) |url| {
+            self.api_url = url;
         } else |_| {}
     }
 
@@ -2875,4 +2880,136 @@ test "model fallback entry constructible" {
     };
     try std.testing.expectEqualStrings("claude-opus-4", entry.model);
     try std.testing.expectEqual(@as(usize, 2), entry.fallbacks.len);
+}
+
+// ── Environment variable override tests ─────────────────────────
+
+test "applyEnvOverrides does not crash on default config" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    // Should not crash even when no NULLCLAW_* env vars are set
+    cfg.applyEnvOverrides();
+    // Default values should remain intact
+    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", cfg.default_model.?);
+    try std.testing.expect(cfg.api_key == null);
+    try std.testing.expect(cfg.api_url == null);
+}
+
+test "applyEnvOverrides preserves existing values when env vars absent" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "anthropic",
+        .default_model = "claude-opus-4",
+        .api_key = "sk-test-key-123",
+        .default_temperature = 0.5,
+    };
+    cfg.applyEnvOverrides();
+    // All values should remain the same since no env vars are set
+    try std.testing.expectEqualStrings("anthropic", cfg.default_provider);
+    try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
+    try std.testing.expectEqualStrings("sk-test-key-123", cfg.api_key.?);
+    try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
+}
+
+test "applyEnvOverrides preserves workspace_dir when env var absent" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/custom/workspace",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.applyEnvOverrides();
+    try std.testing.expectEqualStrings("/custom/workspace", cfg.workspace_dir);
+}
+
+test "applyEnvOverrides preserves gateway config when env vars absent" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.gateway.port = 9999;
+    cfg.gateway.host = "0.0.0.0";
+    cfg.gateway.allow_public_bind = true;
+    cfg.applyEnvOverrides();
+    try std.testing.expectEqual(@as(u16, 9999), cfg.gateway.port);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway.host);
+    try std.testing.expect(cfg.gateway.allow_public_bind);
+}
+
+test "applyEnvOverrides preserves api_url when NULLCLAW_BASE_URL absent" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .api_url = "http://localhost:11434",
+    };
+    cfg.applyEnvOverrides();
+    try std.testing.expectEqualStrings("http://localhost:11434", cfg.api_url.?);
+}
+
+test "applyEnvOverrides preserves null api_url when NULLCLAW_BASE_URL absent" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.applyEnvOverrides();
+    try std.testing.expect(cfg.api_url == null);
+}
+
+test "applyEnvOverrides is idempotent on default config" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    // Apply overrides multiple times — should not change defaults
+    cfg.applyEnvOverrides();
+    cfg.applyEnvOverrides();
+    cfg.applyEnvOverrides();
+    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", cfg.default_model.?);
+    try std.testing.expect(cfg.api_key == null);
+    try std.testing.expectEqual(@as(f64, 0.7), cfg.default_temperature);
+}
+
+test "syncFlatFields copies nested values to flat aliases" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    cfg.default_temperature = 1.2;
+    cfg.memory.backend = "json";
+    cfg.memory.auto_save = false;
+    cfg.heartbeat.enabled = true;
+    cfg.heartbeat.interval_minutes = 15;
+    cfg.gateway.host = "0.0.0.0";
+    cfg.gateway.port = 4000;
+    cfg.autonomy.workspace_only = false;
+    cfg.autonomy.max_actions_per_hour = 99;
+    cfg.syncFlatFields();
+    try std.testing.expectEqual(@as(f64, 1.2), cfg.temperature);
+    try std.testing.expectEqualStrings("json", cfg.memory_backend);
+    try std.testing.expect(!cfg.memory_auto_save);
+    try std.testing.expect(cfg.heartbeat_enabled);
+    try std.testing.expectEqual(@as(u32, 15), cfg.heartbeat_interval_minutes);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.gateway_host);
+    try std.testing.expectEqual(@as(u16, 4000), cfg.gateway_port);
+    try std.testing.expect(!cfg.workspace_only);
+    try std.testing.expectEqual(@as(u32, 99), cfg.max_actions_per_hour);
 }

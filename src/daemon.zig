@@ -168,7 +168,7 @@ const CHANNEL_WATCH_INTERVAL_SECS: u64 = 60;
 
 /// Scheduler supervision thread — loads cron jobs and runs the scheduler loop.
 /// On error (scheduler crash), logs and restarts with exponential backoff.
-fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
+fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var backoff_secs: u64 = SCHEDULER_INITIAL_BACKOFF_SECS;
 
     while (!isShutdownRequested()) {
@@ -184,7 +184,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         // run() blocks forever (while(true) loop) — if it returns, something went wrong.
         // Since run() can't actually return an error (it catches internally), we treat
         // any return from run() as an unexpected exit.
-        scheduler.run(config.reliability.scheduler_poll_secs);
+        scheduler.run(config.reliability.scheduler_poll_secs, event_bus);
 
         // If we reach here, scheduler exited unexpectedly
         if (isShutdownRequested()) break;
@@ -276,11 +276,14 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config) !void {
         }
     }
 
+    // Event bus (created before scheduler so cron jobs can deliver via bus)
+    var event_bus = bus_mod.Bus.init();
+
     // Spawn scheduler thread
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{}, schedulerThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{}, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
@@ -299,8 +302,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config) !void {
         }
     }
 
-    // Event bus + outbound dispatcher
-    var event_bus = bus_mod.Bus.init();
+    // Outbound dispatcher
     var channel_registry = dispatch.ChannelRegistry.init(allocator);
     defer channel_registry.deinit();
     var dispatch_stats = dispatch.DispatchStats{};

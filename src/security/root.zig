@@ -60,6 +60,8 @@ pub const LandlockSandbox = landlock.LandlockSandbox;
 pub const FirejailSandbox = firejail.FirejailSandbox;
 pub const BubblewrapSandbox = bubblewrap.BubblewrapSandbox;
 pub const DockerSandbox = docker.DockerSandbox;
+pub const ValidationResult = docker.ValidationResult;
+pub const validateWorkspaceMount = docker.validateWorkspaceMount;
 
 pub const RateTracker = tracker.RateTracker;
 

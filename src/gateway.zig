@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (paired_tokens)
-//!   - Endpoints: /health, /pair, /webhook, /whatsapp, /telegram
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -198,6 +198,7 @@ pub const GatewayState = struct {
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
     whatsapp_verify_token: []const u8,
+    whatsapp_app_secret: []const u8,
     paired_tokens: []const []const u8,
     telegram_bot_token: []const u8,
 
@@ -211,6 +212,7 @@ pub const GatewayState = struct {
             .rate_limiter = GatewayRateLimiter.init(10, 30),
             .idempotency = IdempotencyStore.init(300),
             .whatsapp_verify_token = verify_token,
+            .whatsapp_app_secret = "",
             .paired_tokens = &.{},
             .telegram_bot_token = "",
         };
@@ -230,6 +232,46 @@ fn isHealthOk() bool {
         if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) return false;
     }
     return true;
+}
+
+/// Readiness response — encapsulates HTTP status and body for /ready.
+pub const ReadyResponse = struct {
+    http_status: []const u8,
+    body: []const u8,
+    /// Whether body was allocated and should be freed by caller.
+    allocated: bool,
+};
+
+/// Handle the /ready endpoint logic. Queries the global health registry
+/// and returns the appropriate HTTP status and JSON body.
+/// If `allocated` is true in the result, the caller owns `body` memory.
+pub fn handleReady(allocator: std.mem.Allocator) ReadyResponse {
+    const readiness = health.checkRegistryReadiness(allocator) catch {
+        return .{
+            .http_status = "500 Internal Server Error",
+            .body = "{\"status\":\"not_ready\",\"checks\":[]}",
+            .allocated = false,
+        };
+    };
+    // formatJson must be called before freeing the checks slice
+    const json_body = readiness.formatJson(allocator) catch {
+        if (readiness.checks.len > 0) {
+            allocator.free(readiness.checks);
+        }
+        return .{
+            .http_status = "500 Internal Server Error",
+            .body = "{\"status\":\"not_ready\",\"checks\":[]}",
+            .allocated = false,
+        };
+    };
+    if (readiness.checks.len > 0) {
+        allocator.free(readiness.checks);
+    }
+    return .{
+        .http_status = if (readiness.status == .ready) "200 OK" else "503 Service Unavailable",
+        .body = json_body,
+        .allocated = true,
+    };
 }
 
 /// Extract a query parameter value from a URL target string.
@@ -328,6 +370,71 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (al != bl) return false;
     }
     return true;
+}
+
+// ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
+
+/// Verify a WhatsApp webhook HMAC-SHA256 signature.
+///
+/// Meta sends `X-Hub-Signature-256: sha256=<hex-digest>` on every webhook POST.
+/// This function computes HMAC-SHA256 over `body` using `app_secret` as the key,
+/// then performs a constant-time comparison against the hex digest in the header.
+///
+/// Returns `true` if the signature is valid, `false` otherwise.
+pub fn verifyWhatsappSignature(body: []const u8, signature_header: []const u8, app_secret: []const u8) bool {
+    // Reject empty secrets — misconfiguration guard
+    if (app_secret.len == 0) return false;
+
+    // Header must start with "sha256="
+    const prefix = "sha256=";
+    if (!std.mem.startsWith(u8, signature_header, prefix)) return false;
+
+    const provided_hex = signature_header[prefix.len..];
+
+    // HMAC-SHA256 digest is 32 bytes = 64 hex chars
+    if (provided_hex.len != 64) return false;
+
+    // Decode the provided hex string into bytes
+    const provided_bytes = hexDecode(provided_hex) orelse return false;
+
+    // Compute expected HMAC-SHA256
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var expected: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&expected, body, app_secret);
+
+    // Constant-time comparison — prevents timing side-channels
+    return constantTimeEql(&expected, &provided_bytes);
+}
+
+/// Decode a 64-char lowercase hex string into 32 bytes.
+/// Returns null if any character is not a valid hex digit.
+fn hexDecode(hex: []const u8) ?[32]u8 {
+    if (hex.len != 64) return null;
+    var out: [32]u8 = undefined;
+    for (0..32) |i| {
+        const hi = hexVal(hex[i * 2]) orelse return null;
+        const lo = hexVal(hex[i * 2 + 1]) orelse return null;
+        out[i] = (hi << 4) | lo;
+    }
+    return out;
+}
+
+/// Convert a single hex character to its 4-bit value.
+fn hexVal(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
+/// Constant-time comparison of two 32-byte arrays.
+/// Always examines all bytes regardless of where a mismatch occurs.
+fn constantTimeEql(a: *const [32]u8, b: *const [32]u8) bool {
+    var diff: u8 = 0;
+    for (a, b) |ab, bb| {
+        diff |= ab ^ bb;
+    }
+    return diff == 0;
 }
 
 // ── JSON Helpers ────────────────────────────────────────────────
@@ -481,7 +588,7 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     health.markComponentOk("gateway");
 
@@ -530,6 +637,29 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
 
         if (std.mem.eql(u8, target, "/health") or std.mem.startsWith(u8, target, "/health?")) {
             response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
+        } else if (std.mem.eql(u8, target, "/ready") or std.mem.startsWith(u8, target, "/ready?")) {
+            const readiness = health.checkRegistryReadiness(state.allocator) catch {
+                response_status = "500 Internal Server Error";
+                response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
+                continue;
+            };
+            // formatJson must run before freeing the checks slice
+            const json_body = readiness.formatJson(state.allocator) catch {
+                if (readiness.checks.len > 0) {
+                    state.allocator.free(readiness.checks);
+                }
+                response_status = "500 Internal Server Error";
+                response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
+                continue;
+            };
+            if (readiness.checks.len > 0) {
+                state.allocator.free(readiness.checks);
+            }
+            dynamic_body = @constCast(json_body);
+            response_body = json_body;
+            if (readiness.status != .ready) {
+                response_status = "503 Service Unavailable";
+            }
         } else if (is_post and (std.mem.eql(u8, target, "/webhook") or std.mem.startsWith(u8, target, "/webhook?"))) {
             // Bearer token validation
             const auth_header = extractHeader(raw, "Authorization");
@@ -625,6 +755,36 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 if (!state.rate_limiter.allowWebhook(state.allocator, "whatsapp")) {
                     response_status = "429 Too Many Requests";
                     response_body = "{\"error\":\"rate limited\"}";
+                } else if (state.whatsapp_app_secret.len > 0) sig_check: {
+                    // HMAC-SHA256 signature verification (when app_secret is configured)
+                    const sig_header = extractHeader(raw, "X-Hub-Signature-256") orelse {
+                        response_status = "403 Forbidden";
+                        response_body = "{\"error\":\"missing signature\"}";
+                        break :sig_check;
+                    };
+                    const body_for_sig = extractBody(raw) orelse "";
+                    if (!verifyWhatsappSignature(body_for_sig, sig_header, state.whatsapp_app_secret)) {
+                        response_status = "403 Forbidden";
+                        response_body = "{\"error\":\"invalid signature\"}";
+                        break :sig_check;
+                    }
+                    // Signature valid — proceed with message processing
+                    const body = if (body_for_sig.len > 0) body_for_sig else null;
+                    if (body) |b| {
+                        const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
+                        if (msg_text) |mt| {
+                            if (processIncomingMessage(state.allocator, mt)) |resp| {
+                                dynamic_body = resp;
+                                response_body = resp;
+                            } else |_| {
+                                response_body = "{\"status\":\"received\"}";
+                            }
+                        } else {
+                            response_body = "{\"status\":\"received\"}";
+                        }
+                    } else {
+                        response_body = "{\"status\":\"received\"}";
+                    }
                 } else {
                     const body = extractBody(raw);
                     if (body) |b| {
@@ -1053,4 +1213,230 @@ test "asciiEqlIgnoreCase different strings" {
 
 test "asciiEqlIgnoreCase empty strings" {
     try std.testing.expect(asciiEqlIgnoreCase("", ""));
+}
+
+// ── WhatsApp HMAC-SHA256 Signature Verification tests ───────────
+
+test "verifyWhatsappSignature valid signature" {
+    // Compute a real HMAC-SHA256 and verify it passes
+    const body = "{\"entry\":[{\"changes\":[{\"value\":{\"messages\":[{\"text\":{\"body\":\"hello\"}}]}}]}]}";
+    const secret = "my_app_secret";
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, secret);
+    // Format as hex
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        const byte = mac[i];
+        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
+        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+    var header_buf: [71]u8 = undefined; // "sha256=" (7) + 64 hex chars
+    @memcpy(header_buf[0..7], "sha256=");
+    @memcpy(header_buf[7..71], &hex_buf);
+    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
+}
+
+test "verifyWhatsappSignature invalid signature rejected" {
+    const body = "{\"message\":\"test\"}";
+    const secret = "correct_secret";
+    // Provide a well-formed but wrong signature (all zeros)
+    const bad_sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expect(!verifyWhatsappSignature(body, bad_sig, secret));
+}
+
+test "verifyWhatsappSignature missing sha256= prefix rejected" {
+    const body = "test body";
+    const secret = "secret";
+    const no_prefix = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    try std.testing.expect(!verifyWhatsappSignature(body, no_prefix, secret));
+}
+
+test "verifyWhatsappSignature empty body with valid signature" {
+    const body = "";
+    const secret = "empty_body_secret";
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, secret);
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        const byte = mac[i];
+        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
+        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+    var header_buf: [71]u8 = undefined;
+    @memcpy(header_buf[0..7], "sha256=");
+    @memcpy(header_buf[7..71], &hex_buf);
+    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
+}
+
+test "verifyWhatsappSignature empty secret returns false" {
+    const body = "any body";
+    const sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expect(!verifyWhatsappSignature(body, sig, ""));
+}
+
+test "verifyWhatsappSignature wrong secret rejected" {
+    const body = "{\"data\":\"payload\"}";
+    const correct_secret = "real_secret";
+    const wrong_secret = "wrong_secret";
+    // Compute signature with correct secret
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, correct_secret);
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        const byte = mac[i];
+        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
+        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+    var header_buf: [71]u8 = undefined;
+    @memcpy(header_buf[0..7], "sha256=");
+    @memcpy(header_buf[7..71], &hex_buf);
+    // Verify with wrong secret — should fail
+    try std.testing.expect(!verifyWhatsappSignature(body, &header_buf, wrong_secret));
+}
+
+test "verifyWhatsappSignature constant-time comparison basic check" {
+    // Verify that two identical MACs pass and two differing-by-one-bit MACs fail.
+    // This doesn't prove constant-time, but ensures the comparison logic is correct.
+    const body = "timing test body";
+    const secret = "timing_secret";
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, secret);
+
+    // constantTimeEql with itself
+    try std.testing.expect(constantTimeEql(&mac, &mac));
+
+    // Flip one bit in the last byte
+    var altered = mac;
+    altered[31] ^= 0x01;
+    try std.testing.expect(!constantTimeEql(&mac, &altered));
+
+    // Flip one bit in the first byte
+    var altered2 = mac;
+    altered2[0] ^= 0x80;
+    try std.testing.expect(!constantTimeEql(&mac, &altered2));
+}
+
+test "verifyWhatsappSignature hex encoding edge cases" {
+    // Truncated hex (too short)
+    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=abcdef", "secret"));
+    // Too long hex
+    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=00000000000000000000000000000000000000000000000000000000000000001", "secret"));
+    // Invalid hex characters
+    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "secret"));
+    // Empty signature header
+    try std.testing.expect(!verifyWhatsappSignature("body", "", "secret"));
+    // Just the prefix, no hex
+    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=", "secret"));
+}
+
+test "verifyWhatsappSignature uppercase hex accepted" {
+    // Meta typically sends lowercase, but we accept uppercase too
+    const body = "uppercase hex test";
+    const secret = "hex_secret";
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, body, secret);
+    var hex_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        const byte = mac[i];
+        hex_buf[i * 2] = "0123456789ABCDEF"[byte >> 4];
+        hex_buf[i * 2 + 1] = "0123456789ABCDEF"[byte & 0x0f];
+    }
+    var header_buf: [71]u8 = undefined;
+    @memcpy(header_buf[0..7], "sha256=");
+    @memcpy(header_buf[7..71], &hex_buf);
+    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
+}
+
+test "GatewayState init has empty whatsapp_app_secret" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expectEqualStrings("", state.whatsapp_app_secret);
+}
+
+// ── /ready endpoint tests ────────────────────────────────────────────
+
+test "handleReady all components healthy returns 200" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentOk("database");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    // Verify JSON contains "ready" status
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ready\"") != null);
+}
+
+test "handleReady one component unhealthy returns 503" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError("database", "connection refused");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"not_ready\"") != null);
+}
+
+test "handleReady no components returns 200 vacuously" {
+    health.reset();
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"checks\":[]") != null);
+}
+
+test "handleReady JSON output has checks array" {
+    health.reset();
+    health.markComponentOk("agent");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"checks\":[") != null);
+    // Should contain the agent component
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":true") != null);
+}
+
+test "handleReady multiple unhealthy components returns 503" {
+    health.reset();
+    health.markComponentError("gateway", "port in use");
+    health.markComponentError("database", "disk full");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"not_ready\"") != null);
+}
+
+test "handleReady response body is valid JSON structure" {
+    health.reset();
+    health.markComponentOk("test-svc");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    // Must start with { and end with }
+    try std.testing.expect(resp.body.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), resp.body[0]);
+    try std.testing.expectEqual(@as(u8, '}'), resp.body[resp.body.len - 1]);
+}
+
+test "handleReady unhealthy component includes error message" {
+    health.reset();
+    health.markComponentError("cache", "redis timeout");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"message\":\"redis timeout\"") != null);
+}
+
+test "handleReady recovered component shows healthy" {
+    health.reset();
+    health.markComponentError("db", "down");
+    health.markComponentOk("db");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":true") != null);
 }

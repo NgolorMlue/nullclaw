@@ -138,6 +138,115 @@ pub const HealthCheck = struct {
     message: ?[]const u8 = null,
 };
 
+// ── Readiness Check System ───────────────────────────────────────────
+
+pub const ReadinessStatus = enum {
+    ready,
+    not_ready,
+};
+
+pub const ComponentCheck = struct {
+    name: []const u8,
+    healthy: bool,
+    message: ?[]const u8 = null,
+};
+
+pub const ReadinessResult = struct {
+    status: ReadinessStatus,
+    checks: []const ComponentCheck,
+
+    /// Serialize the readiness result as JSON. Caller owns the returned memory.
+    pub fn formatJson(self: ReadinessResult, allocator: std.mem.Allocator) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+
+        const status_str = if (self.status == .ready) "ready" else "not_ready";
+        try w.print("{{\"status\":\"{s}\",\"checks\":[", .{status_str});
+
+        for (self.checks, 0..) |check, i| {
+            if (i > 0) try w.writeByte(',');
+            const healthy_str = if (check.healthy) "true" else "false";
+            try w.print("{{\"name\":\"{s}\",\"healthy\":{s}", .{ check.name, healthy_str });
+            if (check.message) |msg| {
+                try w.print(",\"message\":\"{s}\"", .{msg});
+            }
+            try w.writeByte('}');
+        }
+
+        try w.writeAll("]}");
+        return try allocator.dupe(u8, buf.items);
+    }
+};
+
+/// Check readiness of a set of component health entries.
+/// Returns `.ready` if all components are healthy (or slice is empty), `.not_ready` otherwise.
+pub fn checkReadiness(components: []const ComponentHealth) ReadinessResult {
+    // We need to build ComponentCheck entries. Since we can't allocate here
+    // (no allocator), we use a static buffer for up to 32 components.
+    const max_components = 32;
+    const S = struct {
+        var checks_buf: [max_components]ComponentCheck = undefined;
+    };
+
+    const count = @min(components.len, max_components);
+    var all_healthy = true;
+
+    for (0..count) |i| {
+        const c = components[i];
+        const healthy = std.mem.eql(u8, c.status, "ok");
+        if (!healthy) all_healthy = false;
+        S.checks_buf[i] = .{
+            .name = c.last_error orelse c.status,
+            .healthy = healthy,
+            .message = c.last_error,
+        };
+    }
+
+    return .{
+        .status = if (all_healthy) .ready else .not_ready,
+        .checks = S.checks_buf[0..count],
+    };
+}
+
+/// Check readiness from the global health registry. Returns result with
+/// named component checks. Uses provided allocator for the checks slice.
+/// Caller owns the returned checks slice.
+pub fn checkRegistryReadiness(allocator: std.mem.Allocator) !ReadinessResult {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    ensureInit();
+
+    const count = registry_components.count();
+    if (count == 0) {
+        return .{
+            .status = .ready,
+            .checks = &.{},
+        };
+    }
+
+    const checks = try allocator.alloc(ComponentCheck, count);
+    var all_healthy = true;
+    var i: usize = 0;
+
+    var iter = registry_components.iterator();
+    while (iter.next()) |entry| {
+        const healthy = std.mem.eql(u8, entry.value_ptr.status, "ok");
+        if (!healthy) all_healthy = false;
+        checks[i] = .{
+            .name = entry.key_ptr.*,
+            .healthy = healthy,
+            .message = entry.value_ptr.last_error,
+        };
+        i += 1;
+    }
+
+    return .{
+        .status = if (all_healthy) .ready else .not_ready,
+        .checks = checks,
+    };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "markComponentOk initializes component" {
@@ -183,3 +292,163 @@ test "snapshot returns valid state" {
 }
 
 test "health module compiles" {}
+
+// ── Readiness Check tests ────────────────────────────────────────────
+
+test "checkReadiness all healthy returns ready" {
+    const components = [_]ComponentHealth{
+        .{ .status = "ok" },
+        .{ .status = "ok" },
+        .{ .status = "ok" },
+    };
+    const result = checkReadiness(&components);
+    try std.testing.expectEqual(ReadinessStatus.ready, result.status);
+    try std.testing.expectEqual(@as(usize, 3), result.checks.len);
+    for (result.checks) |check| {
+        try std.testing.expect(check.healthy);
+    }
+}
+
+test "checkReadiness one unhealthy returns not_ready" {
+    const components = [_]ComponentHealth{
+        .{ .status = "ok" },
+        .{ .status = "error", .last_error = "connection refused" },
+        .{ .status = "ok" },
+    };
+    const result = checkReadiness(&components);
+    try std.testing.expectEqual(ReadinessStatus.not_ready, result.status);
+    try std.testing.expectEqual(@as(usize, 3), result.checks.len);
+    // At least one check should be unhealthy
+    var found_unhealthy = false;
+    for (result.checks) |check| {
+        if (!check.healthy) found_unhealthy = true;
+    }
+    try std.testing.expect(found_unhealthy);
+}
+
+test "checkReadiness empty slice returns ready" {
+    const components = [_]ComponentHealth{};
+    const result = checkReadiness(&components);
+    try std.testing.expectEqual(ReadinessStatus.ready, result.status);
+    try std.testing.expectEqual(@as(usize, 0), result.checks.len);
+}
+
+test "checkReadiness multiple unhealthy returns not_ready" {
+    const components = [_]ComponentHealth{
+        .{ .status = "error", .last_error = "timeout" },
+        .{ .status = "error", .last_error = "dns failure" },
+    };
+    const result = checkReadiness(&components);
+    try std.testing.expectEqual(ReadinessStatus.not_ready, result.status);
+    for (result.checks) |check| {
+        try std.testing.expect(!check.healthy);
+    }
+}
+
+test "ComponentCheck defaults message to null" {
+    const check: ComponentCheck = .{
+        .name = "test-component",
+        .healthy = true,
+    };
+    try std.testing.expect(check.message == null);
+    try std.testing.expect(check.healthy);
+    try std.testing.expectEqualStrings("test-component", check.name);
+}
+
+test "ReadinessResult formatJson ready with no checks" {
+    const result: ReadinessResult = .{
+        .status = .ready,
+        .checks = &.{},
+    };
+    const json = try result.formatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"status\":\"ready\",\"checks\":[]}", json);
+}
+
+test "ReadinessResult formatJson ready with healthy checks" {
+    const checks = [_]ComponentCheck{
+        .{ .name = "gateway", .healthy = true, .message = null },
+    };
+    const result: ReadinessResult = .{
+        .status = .ready,
+        .checks = &checks,
+    };
+    const json = try result.formatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"ready\",\"checks\":[{\"name\":\"gateway\",\"healthy\":true}]}",
+        json,
+    );
+}
+
+test "ReadinessResult formatJson not_ready with message" {
+    const checks = [_]ComponentCheck{
+        .{ .name = "db", .healthy = false, .message = "connection lost" },
+    };
+    const result: ReadinessResult = .{
+        .status = .not_ready,
+        .checks = &checks,
+    };
+    const json = try result.formatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"not_ready\",\"checks\":[{\"name\":\"db\",\"healthy\":false,\"message\":\"connection lost\"}]}",
+        json,
+    );
+}
+
+test "ReadinessResult formatJson multiple checks" {
+    const checks = [_]ComponentCheck{
+        .{ .name = "gateway", .healthy = true, .message = null },
+        .{ .name = "db", .healthy = false, .message = "timeout" },
+    };
+    const result: ReadinessResult = .{
+        .status = .not_ready,
+        .checks = &checks,
+    };
+    const json = try result.formatJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"not_ready\",\"checks\":[{\"name\":\"gateway\",\"healthy\":true},{\"name\":\"db\",\"healthy\":false,\"message\":\"timeout\"}]}",
+        json,
+    );
+}
+
+test "checkRegistryReadiness no components returns ready" {
+    reset();
+    const result = try checkRegistryReadiness(std.testing.allocator);
+    // Empty checks slice from static empty, no need to free
+    try std.testing.expectEqual(ReadinessStatus.ready, result.status);
+    try std.testing.expectEqual(@as(usize, 0), result.checks.len);
+}
+
+test "checkRegistryReadiness all ok returns ready" {
+    reset();
+    markComponentOk("gw");
+    markComponentOk("db");
+    const result = try checkRegistryReadiness(std.testing.allocator);
+    defer std.testing.allocator.free(result.checks);
+    try std.testing.expectEqual(ReadinessStatus.ready, result.status);
+    try std.testing.expectEqual(@as(usize, 2), result.checks.len);
+    for (result.checks) |check| {
+        try std.testing.expect(check.healthy);
+    }
+}
+
+test "checkRegistryReadiness with error returns not_ready" {
+    reset();
+    markComponentOk("gw");
+    markComponentError("db", "connection refused");
+    const result = try checkRegistryReadiness(std.testing.allocator);
+    defer std.testing.allocator.free(result.checks);
+    try std.testing.expectEqual(ReadinessStatus.not_ready, result.status);
+    try std.testing.expectEqual(@as(usize, 2), result.checks.len);
+    var found_unhealthy = false;
+    for (result.checks) |check| {
+        if (!check.healthy) {
+            found_unhealthy = true;
+            try std.testing.expectEqualStrings("connection refused", check.message.?);
+        }
+    }
+    try std.testing.expect(found_unhealthy);
+}
