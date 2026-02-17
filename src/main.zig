@@ -560,8 +560,7 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.debug.print("Running model latency benchmark...\n", .{});
         std.debug.print("Configure a provider first (nullclaw onboard).\n", .{});
     } else if (std.mem.eql(u8, subcmd, "refresh")) {
-        std.debug.print("Refreshing model catalog...\n", .{});
-        std.debug.print("Model catalog updated.\n", .{});
+        try yc.onboard.runModelsRefresh(allocator);
     } else {
         std.debug.print("Unknown models command: {s}\n", .{subcmd});
         std.process.exit(1);

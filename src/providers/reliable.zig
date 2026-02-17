@@ -100,17 +100,22 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
 
 /// Provider wrapper with retry and provider fallback behavior.
 ///
-/// Wraps multiple providers and tries them in order. For each provider,
-/// retries with exponential backoff on transient errors. Skips retries
-/// for non-retryable client errors (4xx except 429/408).
+/// Wraps an inner provider and retries on transient errors with exponential
+/// backoff. Skips retries for non-retryable client errors (4xx except 429/408).
+/// On rate-limit errors, rotates API keys if available.
 pub const ReliableProvider = struct {
-    /// List of (name, provider) pairs. First is primary.
+    /// The wrapped inner provider to delegate calls to.
+    inner: Provider,
+    /// List of provider names (for diagnostics/logging).
     provider_names: []const []const u8,
     max_retries: u32,
     base_backoff_ms: u64,
     /// Extra API keys for rotation on rate-limit errors.
     api_keys: []const []const u8,
     key_index: usize,
+    /// Last error message from failed attempt (for retry-after parsing).
+    last_error_msg: [256]u8,
+    last_error_len: usize,
 
     pub fn init(
         provider_names: []const []const u8,
@@ -118,16 +123,43 @@ pub const ReliableProvider = struct {
         base_backoff_ms: u64,
     ) ReliableProvider {
         return .{
+            .inner = undefined,
             .provider_names = provider_names,
             .max_retries = max_retries,
             .base_backoff_ms = @max(base_backoff_ms, 50),
             .api_keys = &.{},
             .key_index = 0,
+            .last_error_msg = undefined,
+            .last_error_len = 0,
+        };
+    }
+
+    /// Initialize with an inner provider to wrap.
+    pub fn initWithProvider(
+        inner: Provider,
+        max_retries: u32,
+        base_backoff_ms: u64,
+    ) ReliableProvider {
+        return .{
+            .inner = inner,
+            .provider_names = &.{},
+            .max_retries = max_retries,
+            .base_backoff_ms = @max(base_backoff_ms, 50),
+            .api_keys = &.{},
+            .key_index = 0,
+            .last_error_msg = undefined,
+            .last_error_len = 0,
         };
     }
 
     pub fn withApiKeys(self: *ReliableProvider, keys: []const []const u8) *ReliableProvider {
         self.api_keys = keys;
+        return self;
+    }
+
+    /// Set the inner provider to wrap.
+    pub fn withInner(self: *ReliableProvider, inner: Provider) *ReliableProvider {
+        self.inner = inner;
         return self;
     }
 
@@ -146,6 +178,137 @@ pub const ReliableProvider = struct {
             return @max(@min(retry_after, 30_000), base);
         }
         return base;
+    }
+
+    /// Store an error name for retry-after inspection.
+    fn storeErrorName(self: *ReliableProvider, err: anyerror) void {
+        const name = @errorName(err);
+        const copy_len = @min(name.len, self.last_error_msg.len);
+        @memcpy(self.last_error_msg[0..copy_len], name[0..copy_len]);
+        self.last_error_len = copy_len;
+    }
+
+    /// Get the last stored error message.
+    fn lastErrorSlice(self: *const ReliableProvider) []const u8 {
+        return self.last_error_msg[0..self.last_error_len];
+    }
+
+    // ── Provider vtable implementation ──
+
+    const vtable_impl = Provider.VTable{
+        .chatWithSystem = chatWithSystemImpl,
+        .chat = chatImpl,
+        .supportsNativeTools = supportsNativeToolsImpl,
+        .getName = getNameImpl,
+        .deinit = deinitImpl,
+    };
+
+    /// Create a Provider interface from this ReliableProvider.
+    pub fn provider(self: *ReliableProvider) Provider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_impl,
+        };
+    }
+
+    fn chatWithSystemImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        model: []const u8,
+        temperature: f64,
+    ) anyerror![]const u8 {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        var backoff_ms = self.base_backoff_ms;
+        var last_err: anyerror = error.AllProvidersFailed;
+
+        var attempt: u32 = 0;
+        while (attempt <= self.max_retries) : (attempt += 1) {
+            if (self.inner.chatWithSystem(allocator, system_prompt, message, model, temperature)) |result| {
+                return result;
+            } else |err| {
+                last_err = err;
+                self.storeErrorName(err);
+                const err_slice = self.lastErrorSlice();
+
+                // Non-retryable errors: stop immediately
+                if (isNonRetryable(err_slice)) {
+                    return err;
+                }
+
+                // Rate-limited: try rotating API key
+                if (isRateLimited(err_slice)) {
+                    _ = self.rotateKey();
+                }
+
+                // If we have more retries left, sleep with backoff
+                if (attempt < self.max_retries) {
+                    const wait = self.computeBackoff(backoff_ms, err_slice);
+                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+                }
+            }
+        }
+
+        return last_err;
+    }
+
+    fn chatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+    ) anyerror!ChatResponse {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        var backoff_ms = self.base_backoff_ms;
+        var last_err: anyerror = error.AllProvidersFailed;
+
+        var attempt: u32 = 0;
+        while (attempt <= self.max_retries) : (attempt += 1) {
+            if (self.inner.chat(allocator, request, model, temperature)) |result| {
+                return result;
+            } else |err| {
+                last_err = err;
+                self.storeErrorName(err);
+                const err_slice = self.lastErrorSlice();
+
+                // Non-retryable errors: stop immediately
+                if (isNonRetryable(err_slice)) {
+                    return err;
+                }
+
+                // Rate-limited: try rotating API key
+                if (isRateLimited(err_slice)) {
+                    _ = self.rotateKey();
+                }
+
+                // If we have more retries left, sleep with backoff
+                if (attempt < self.max_retries) {
+                    const wait = self.computeBackoff(backoff_ms, err_slice);
+                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+                }
+            }
+        }
+
+        return last_err;
+    }
+
+    fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsNativeTools();
+    }
+
+    fn getNameImpl(ptr: *anyopaque) []const u8 {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.getName();
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        self.inner.deinit();
     }
 };
 
@@ -299,4 +462,139 @@ test "ReliableProvider single key rotation" {
 
     try std.testing.expectEqualStrings("only-key", provider.rotateKey().?);
     try std.testing.expectEqualStrings("only-key", provider.rotateKey().?);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Mock provider for vtable retry tests
+// ════════════════════════════════════════════════════════════════════════════
+
+const MockInnerProvider = struct {
+    call_count: u32,
+    fail_until: u32,
+    supports_tools: bool,
+
+    const vtable_mock = Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+    };
+
+    fn toProvider(self: *MockInnerProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_mock };
+    }
+
+    fn mockChatWithSystem(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.call_count <= self.fail_until) {
+            return error.ProviderError;
+        }
+        return "mock response";
+    }
+
+    fn mockChat(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!ChatResponse {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.call_count <= self.fail_until) {
+            return error.ProviderError;
+        }
+        return ChatResponse{ .content = "mock chat" };
+    }
+
+    fn mockSupportsNativeTools(ptr: *anyopaque) bool {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_tools;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "MockProvider";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
+};
+
+test "ReliableProvider vtable succeeds without retry" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
+    const prov = reliable.provider();
+
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "test-model", 0.7);
+    try std.testing.expectEqualStrings("mock response", result);
+    try std.testing.expect(mock.call_count == 1);
+}
+
+test "ReliableProvider vtable retries then recovers" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 2, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
+    const prov = reliable.provider();
+
+    const result = try prov.chatWithSystem(std.testing.allocator, "system", "hello", "model", 0.5);
+    try std.testing.expectEqualStrings("mock response", result);
+    // Should have been called 3 times: 2 failures + 1 success
+    try std.testing.expect(mock.call_count == 3);
+}
+
+test "ReliableProvider vtable exhausts retries and returns error" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 50);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectError(error.ProviderError, result);
+    // max_retries=2 means 3 attempts (0, 1, 2)
+    try std.testing.expect(mock.call_count == 3);
+}
+
+test "ReliableProvider vtable chat retries then recovers" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 1, .supports_tools = true };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 50);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expect(mock.call_count == 2);
+}
+
+test "ReliableProvider vtable delegates supportsNativeTools" {
+    var mock_yes = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+    var reliable_yes = ReliableProvider.initWithProvider(mock_yes.toProvider(), 0, 50);
+    try std.testing.expect(reliable_yes.provider().supportsNativeTools() == true);
+
+    var mock_no = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var reliable_no = ReliableProvider.initWithProvider(mock_no.toProvider(), 0, 50);
+    try std.testing.expect(reliable_no.provider().supportsNativeTools() == false);
+}
+
+test "ReliableProvider vtable delegates getName" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
+    try std.testing.expectEqualStrings("MockProvider", reliable.provider().getName());
+}
+
+test "ReliableProvider vtable zero retries fails immediately" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectError(error.ProviderError, result);
+    // With 0 retries, only 1 attempt
+    try std.testing.expect(mock.call_count == 1);
 }

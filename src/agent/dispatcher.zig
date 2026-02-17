@@ -139,6 +139,180 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     return try buf.toOwnedSlice(allocator);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Native Tool Dispatcher — OpenAI-format tool_calls support
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Dispatcher format kind.
+pub const DispatcherKind = enum {
+    xml,
+    native,
+};
+
+/// Detect whether a response string is in OpenAI native tool-call format.
+/// Looks for the `"tool_calls"` key inside a top-level JSON object.
+pub fn isNativeFormat(response: []const u8) bool {
+    // Quick heuristic: must contain "tool_calls" substring
+    if (std.mem.indexOf(u8, response, "\"tool_calls\"") == null) return false;
+
+    // Validate it's inside a parseable JSON object
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+
+    return switch (parsed.value) {
+        .object => |obj| obj.get("tool_calls") != null,
+        else => false,
+    };
+}
+
+/// A single tool call in the OpenAI native format (within the `tool_calls` array).
+const NativeToolCall = struct {
+    id: []const u8,
+    type: []const u8,
+    function: struct {
+        name: []const u8,
+        arguments: []const u8,
+    },
+};
+
+/// Parse tool calls from an OpenAI-format JSON response.
+///
+/// Expected input format (the full response JSON, or just the message object):
+/// ```json
+/// {
+///   "content": "Some text",
+///   "tool_calls": [
+///     {
+///       "id": "call_abc123",
+///       "type": "function",
+///       "function": {
+///         "name": "shell",
+///         "arguments": "{\"command\": \"ls -la\"}"
+///       }
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Returns text content and extracted tool calls (same shape as XML parser).
+pub fn parseNativeToolCalls(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+) !struct { text: []const u8, calls: []ParsedToolCall } {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidNativeFormat,
+    };
+
+    // Extract text content
+    const text = if (obj.get("content")) |content_val| switch (content_val) {
+        .string => |s| try allocator.dupe(u8, s),
+        .null => try allocator.dupe(u8, ""),
+        else => try allocator.dupe(u8, ""),
+    } else try allocator.dupe(u8, "");
+
+    // Extract tool_calls array
+    const tool_calls_val = obj.get("tool_calls") orelse return .{
+        .text = text,
+        .calls = try allocator.alloc(ParsedToolCall, 0),
+    };
+
+    const tool_calls_arr = switch (tool_calls_val) {
+        .array => |a| a,
+        else => return .{
+            .text = text,
+            .calls = try allocator.alloc(ParsedToolCall, 0),
+        },
+    };
+
+    var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        calls.deinit(allocator);
+    }
+
+    for (tool_calls_arr.items) |tc_val| {
+        const tc_obj = switch (tc_val) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        // Extract the function object
+        const func_val = tc_obj.get("function") orelse continue;
+        const func_obj = switch (func_val) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        // Extract function name
+        const name_val = func_obj.get("name") orelse continue;
+        const name_str = switch (name_val) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (name_str.len == 0) continue;
+
+        // Extract arguments (string)
+        const args_str = if (func_obj.get("arguments")) |args_val| switch (args_val) {
+            .string => |s| s,
+            else => "{}",
+        } else "{}";
+
+        // Extract tool call id
+        const tc_id = if (tc_obj.get("id")) |id_val| switch (id_val) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        try calls.append(allocator, .{
+            .name = try allocator.dupe(u8, name_str),
+            .arguments_json = try allocator.dupe(u8, args_str),
+            .tool_call_id = if (tc_id) |id| try allocator.dupe(u8, id) else null,
+        });
+    }
+
+    return .{
+        .text = text,
+        .calls = try calls.toOwnedSlice(allocator),
+    };
+}
+
+/// Format tool execution results as OpenAI-format JSON for the next API call.
+///
+/// Produces an array of tool result messages:
+/// ```json
+/// [
+///   {"role": "tool", "tool_call_id": "call_abc123", "content": "output here"}
+/// ]
+/// ```
+pub fn formatNativeToolResults(allocator: std.mem.Allocator, results: []const ToolExecutionResult) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("[");
+    for (results, 0..) |result, i| {
+        if (i > 0) try w.writeAll(",");
+        const tc_id = result.tool_call_id orelse "unknown";
+
+        // Serialize content as a JSON string value
+        try std.fmt.format(w, "{{\"role\":\"tool\",\"tool_call_id\":{f},\"content\":{f}}}", .{
+            std.json.fmt(tc_id, .{}),
+            std.json.fmt(result.output, .{}),
+        });
+    }
+    try w.writeAll("]");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Find the first JSON object `{...}` in a string, handling nesting.
@@ -607,4 +781,280 @@ test "ToolExecutionResult default tool_call_id is null" {
         .success = true,
     };
     try std.testing.expect(result.tool_call_id == null);
+}
+
+// ── Native tool dispatcher tests ────────────────────────────────
+
+test "isNativeFormat detects OpenAI tool_calls" {
+    const native_response =
+        \\{"content":"ok","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]}
+    ;
+    try std.testing.expect(isNativeFormat(native_response));
+}
+
+test "isNativeFormat rejects XML format" {
+    const xml_response = "Let me check.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{}}\n</tool_call>";
+    try std.testing.expect(!isNativeFormat(xml_response));
+}
+
+test "isNativeFormat rejects plain text" {
+    try std.testing.expect(!isNativeFormat("Just a normal response."));
+}
+
+test "isNativeFormat rejects tool_calls in non-JSON context" {
+    // Contains the substring but is not valid JSON
+    try std.testing.expect(!isNativeFormat("The API returns \"tool_calls\" in the response."));
+}
+
+test "parseNativeToolCalls single call" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"I will list files.","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls -la\"}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings("I will list files.", result.text);
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expectEqualStrings("call_abc", result.calls[0].tool_call_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ls -la") != null);
+}
+
+test "parseNativeToolCalls multiple calls" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"Reading files.","tool_calls":[{"id":"tc1","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"a.txt\"}"}},{"id":"tc2","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"b.txt\"}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("file_read", result.calls[0].name);
+    try std.testing.expectEqualStrings("tc1", result.calls[0].tool_call_id.?);
+    try std.testing.expectEqualStrings("file_read", result.calls[1].name);
+    try std.testing.expectEqualStrings("tc2", result.calls[1].tool_call_id.?);
+}
+
+test "parseNativeToolCalls null content" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":null,"tool_calls":[{"id":"tc1","type":"function","function":{"name":"shell","arguments":"{}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings("", result.text);
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+}
+
+test "parseNativeToolCalls no tool_calls key" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"Just text, no tools."}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings("Just text, no tools.", result.text);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "parseNativeToolCalls empty tool_calls array" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"Done.","tool_calls":[]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings("Done.", result.text);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "parseNativeToolCalls skips entries without function field" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"","tool_calls":[{"id":"tc1","type":"function"},{"id":"tc2","type":"function","function":{"name":"shell","arguments":"{}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+}
+
+test "parseNativeToolCalls skips entries with empty function name" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"","tool_calls":[{"id":"tc1","type":"function","function":{"name":"","arguments":"{}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "parseNativeToolCalls preserves tool_call_id" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"content":"","tool_calls":[{"id":"call_xyz789","type":"function","function":{"name":"search","arguments":"{\"query\":\"test\"}"}}]}
+    ;
+
+    const result = try parseNativeToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("call_xyz789", result.calls[0].tool_call_id.?);
+}
+
+test "formatNativeToolResults single result" {
+    const allocator = std.testing.allocator;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "shell", .output = "hello world", .success = true, .tool_call_id = "call_1" },
+    };
+    const formatted = try formatNativeToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    // Should be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, formatted, .{});
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.ExpectedArray,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    const item = arr.items[0].object;
+    try std.testing.expectEqualStrings("tool", item.get("role").?.string);
+    try std.testing.expectEqualStrings("call_1", item.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("hello world", item.get("content").?.string);
+}
+
+test "formatNativeToolResults multiple results" {
+    const allocator = std.testing.allocator;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "shell", .output = "ok", .success = true, .tool_call_id = "tc1" },
+        .{ .name = "file_read", .output = "content", .success = true, .tool_call_id = "tc2" },
+    };
+    const formatted = try formatNativeToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, formatted, .{});
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.ExpectedArray,
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+    try std.testing.expectEqualStrings("tc1", arr.items[0].object.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("tc2", arr.items[1].object.get("tool_call_id").?.string);
+}
+
+test "formatNativeToolResults missing tool_call_id defaults to unknown" {
+    const allocator = std.testing.allocator;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "shell", .output = "ok", .success = true },
+    };
+    const formatted = try formatNativeToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, formatted, .{});
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.ExpectedArray,
+    };
+
+    try std.testing.expectEqualStrings("unknown", arr.items[0].object.get("tool_call_id").?.string);
+}
+
+test "formatNativeToolResults empty results" {
+    const allocator = std.testing.allocator;
+    const formatted = try formatNativeToolResults(allocator, &.{});
+    defer allocator.free(formatted);
+    try std.testing.expectEqualStrings("[]", formatted);
+}
+
+test "formatNativeToolResults escapes special characters in output" {
+    const allocator = std.testing.allocator;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "shell", .output = "line1\nline2\t\"quoted\"", .success = true, .tool_call_id = "tc1" },
+    };
+    const formatted = try formatNativeToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    // Verify it's valid JSON (will fail if escaping is broken)
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, formatted, .{});
+    defer parsed.deinit();
+
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.ExpectedArray,
+    };
+    try std.testing.expectEqualStrings("line1\nline2\t\"quoted\"", arr.items[0].object.get("content").?.string);
+}
+
+test "DispatcherKind enum values" {
+    try std.testing.expect(@intFromEnum(DispatcherKind.xml) != @intFromEnum(DispatcherKind.native));
 }

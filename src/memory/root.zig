@@ -12,6 +12,7 @@ const std = @import("std");
 pub const sqlite = @import("sqlite.zig");
 pub const markdown = @import("markdown.zig");
 pub const none = @import("none.zig");
+pub const lucid = @import("lucid.zig");
 pub const cache = @import("cache.zig");
 pub const chunker = @import("chunker.zig");
 pub const embeddings = @import("embeddings.zig");
@@ -22,6 +23,7 @@ pub const snapshot = @import("snapshot.zig");
 pub const SqliteMemory = sqlite.SqliteMemory;
 pub const MarkdownMemory = markdown.MarkdownMemory;
 pub const NoneMemory = none.NoneMemory;
+pub const LucidMemory = lucid.LucidMemory;
 pub const ResponseCache = cache.ResponseCache;
 pub const Chunk = chunker.Chunk;
 pub const chunkMarkdown = chunker.chunkMarkdown;
@@ -175,6 +177,7 @@ pub const MemoryBackendKind = enum {
     sqlite_backend,
     markdown_backend,
     none_backend,
+    lucid_backend,
     unknown,
 };
 
@@ -190,6 +193,7 @@ pub fn classifyBackend(backend_name: []const u8) MemoryBackendKind {
     if (std.mem.eql(u8, backend_name, "sqlite")) return .sqlite_backend;
     if (std.mem.eql(u8, backend_name, "markdown")) return .markdown_backend;
     if (std.mem.eql(u8, backend_name, "none")) return .none_backend;
+    if (std.mem.eql(u8, backend_name, "lucid")) return .lucid_backend;
     return .unknown;
 }
 
@@ -211,6 +215,13 @@ pub const selectable_backends = [_]MemoryBackendProfile{
         .auto_save_default = true,
         .uses_sqlite_hygiene = false,
         .sqlite_based = false,
+    },
+    .{
+        .key = "lucid",
+        .label = "Lucid — SQLite + cross-project memory sync via lucid CLI",
+        .auto_save_default = true,
+        .uses_sqlite_hygiene = true,
+        .sqlite_based = true,
     },
     .{
         .key = "none",
@@ -244,6 +255,10 @@ pub fn createMemory(allocator: std.mem.Allocator, backend_name: []const u8, path
         },
         .markdown_backend => {
             var impl_ = try MarkdownMemory.init(allocator, std.mem.span(path));
+            return impl_.memory();
+        },
+        .lucid_backend => {
+            var impl_ = try LucidMemory.init(allocator, path, std.mem.span(path));
             return impl_.memory();
         },
         .none_backend => {
@@ -303,14 +318,16 @@ test "classifyBackend" {
     try std.testing.expect(classifyBackend("sqlite") == .sqlite_backend);
     try std.testing.expect(classifyBackend("markdown") == .markdown_backend);
     try std.testing.expect(classifyBackend("none") == .none_backend);
+    try std.testing.expect(classifyBackend("lucid") == .lucid_backend);
     try std.testing.expect(classifyBackend("redis") == .unknown);
 }
 
 test "selectable backends are ordered" {
-    try std.testing.expect(selectable_backends.len == 3);
+    try std.testing.expect(selectable_backends.len == 4);
     try std.testing.expectEqualStrings("sqlite", selectable_backends[0].key);
     try std.testing.expectEqualStrings("markdown", selectable_backends[1].key);
-    try std.testing.expectEqualStrings("none", selectable_backends[2].key);
+    try std.testing.expectEqualStrings("lucid", selectable_backends[2].key);
+    try std.testing.expectEqualStrings("none", selectable_backends[3].key);
 }
 
 test "defaultBackendKey is sqlite" {
@@ -348,16 +365,23 @@ test "selectable backends sqlite is recommended" {
     try std.testing.expect(selectable_backends[0].auto_save_default);
 }
 
+test "selectable backends lucid is sqlite based" {
+    try std.testing.expect(selectable_backends[2].auto_save_default);
+    try std.testing.expect(selectable_backends[2].sqlite_based);
+    try std.testing.expect(selectable_backends[2].uses_sqlite_hygiene);
+}
+
 test "selectable backends none has no auto save" {
-    try std.testing.expect(!selectable_backends[2].auto_save_default);
-    try std.testing.expect(!selectable_backends[2].sqlite_based);
-    try std.testing.expect(!selectable_backends[2].uses_sqlite_hygiene);
+    try std.testing.expect(!selectable_backends[3].auto_save_default);
+    try std.testing.expect(!selectable_backends[3].sqlite_based);
+    try std.testing.expect(!selectable_backends[3].uses_sqlite_hygiene);
 }
 
 test {
     _ = sqlite;
     _ = markdown;
     _ = none;
+    _ = lucid;
     _ = cache;
     _ = chunker;
     _ = embeddings;

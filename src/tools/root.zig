@@ -167,6 +167,28 @@ pub fn allTools(
     it.* = .{};
     try list.append(allocator, it.tool());
 
+    // Memory tools (work gracefully without a backend)
+    const mst = try allocator.create(memory_store.MemoryStoreTool);
+    mst.* = .{};
+    try list.append(allocator, mst.tool());
+
+    const mrt = try allocator.create(memory_recall.MemoryRecallTool);
+    mrt.* = .{};
+    try list.append(allocator, mrt.tool());
+
+    const mft = try allocator.create(memory_forget.MemoryForgetTool);
+    mft.* = .{};
+    try list.append(allocator, mft.tool());
+
+    // Delegate and schedule tools
+    const dlt = try allocator.create(delegate.DelegateTool);
+    dlt.* = .{};
+    try list.append(allocator, dlt.tool());
+
+    const scht = try allocator.create(schedule.ScheduleTool);
+    scht.* = .{};
+    try list.append(allocator, scht.tool());
+
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{};
@@ -300,36 +322,52 @@ test "all tools includes extras when enabled" {
     });
     defer {
         // Free all heap-allocated tool structs (mix of types)
-        // Order: shell, file_read, file_write, file_edit, git, image_info, http_request, browser
+        // Order: shell, file_read, file_write, file_edit, git, image_info,
+        //        memory_store, memory_recall, memory_forget, delegate, schedule,
+        //        http_request, browser
         std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
         std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*http_request.HttpRequestTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*browser.BrowserTool, @ptrCast(@alignCast(tools[7].ptr))));
+        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
+        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
+        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[8].ptr))));
+        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[9].ptr))));
+        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[10].ptr))));
+        std.testing.allocator.destroy(@as(*http_request.HttpRequestTool, @ptrCast(@alignCast(tools[11].ptr))));
+        std.testing.allocator.destroy(@as(*browser.BrowserTool, @ptrCast(@alignCast(tools[12].ptr))));
         std.testing.allocator.free(tools);
     }
-    // shell + file_read + file_write + file_edit + git + image_info + http_request + browser = 8
-    try std.testing.expectEqual(@as(usize, 8), tools.len);
+    // shell + file_read + file_write + file_edit + git + image_info
+    // + memory_store + memory_recall + memory_forget + delegate + schedule
+    // + http_request + browser = 13
+    try std.testing.expectEqual(@as(usize, 13), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
     defer {
         // Free all heap-allocated tool structs
-        // Order: shell, file_read, file_write, file_edit, git, image_info
+        // Order: shell, file_read, file_write, file_edit, git, image_info,
+        //        memory_store, memory_recall, memory_forget, delegate, schedule
         std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
         std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
         std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
         std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
         std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
         std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
+        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
+        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
+        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[8].ptr))));
+        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[9].ptr))));
+        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[10].ptr))));
         std.testing.allocator.free(tools);
     }
-    // shell + file_read + file_write + file_edit + git + image_info = 6
-    try std.testing.expectEqual(@as(usize, 6), tools.len);
+    // shell + file_read + file_write + file_edit + git + image_info
+    // + memory_store + memory_recall + memory_forget + delegate + schedule = 11
+    try std.testing.expectEqual(@as(usize, 11), tools.len);
 }
 
 test {

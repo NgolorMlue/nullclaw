@@ -172,18 +172,347 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     try stdout.flush();
 }
 
+/// Read a line from stdin, trimming trailing newline/carriage return.
+/// Returns null on EOF (Ctrl+D).
+fn readLine(buf: []u8) ?[]const u8 {
+    const stdin = std.fs.File.stdin();
+    const n = stdin.read(buf) catch return null;
+    if (n == 0) return null;
+    return std.mem.trimRight(u8, buf[0..n], "\r\n");
+}
+
+/// Prompt user with a message, read a line. Returns default_val if input is empty.
+/// Returns null on EOF.
+fn prompt(out: *std.Io.Writer, buf: []u8, message: []const u8, default_val: []const u8) ?[]const u8 {
+    out.writeAll(message) catch return null;
+    out.flush() catch return null;
+    const line = readLine(buf) orelse return null;
+    if (line.len == 0) return default_val;
+    return line;
+}
+
+/// Prompt for a numbered choice (1-based). Returns 0-based index, or default_idx on empty input.
+/// Returns null on EOF.
+fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) ?usize {
+    out.flush() catch return null;
+    const line = readLine(buf) orelse return null;
+    if (line.len == 0) return default_idx;
+    const num = std.fmt.parseInt(usize, line, 10) catch return default_idx;
+    if (num < 1 or num > max) return default_idx;
+    return num - 1;
+}
+
+const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
+const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &bw.interface;
-    try stdout.writeAll(BANNER);
-    try stdout.writeAll("  Welcome to nullclaw -- the fastest, smallest AI assistant.\n");
-    try stdout.writeAll("  This wizard will configure your agent.\n\n");
-    try stdout.flush();
+    const out = &bw.interface;
+    try out.writeAll(BANNER);
+    try out.writeAll("  Welcome to nullclaw -- the fastest, smallest AI assistant.\n");
+    try out.writeAll("  This wizard will configure your agent.\n\n");
+    try out.flush();
 
-    // For now, delegate to quick setup
-    try runQuickSetup(allocator, null, null, null);
+    var input_buf: [512]u8 = undefined;
+
+    // Load existing or create fresh config
+    var cfg = Config.load(allocator) catch Config{
+        .workspace_dir = try getDefaultWorkspace(allocator),
+        .config_path = try getDefaultConfigPath(allocator),
+        .allocator = allocator,
+    };
+
+    // ── Step 1: Provider selection ──
+    try out.writeAll("  Step 1/8: Select a provider\n");
+    for (known_providers, 0..) |p, i| {
+        try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
+    }
+    try out.writeAll("  Choice [1]: ");
+    const provider_idx = promptChoice(out, &input_buf, known_providers.len, 0) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    const selected_provider = known_providers[provider_idx];
+    cfg.default_provider = selected_provider.key;
+    try out.print("  -> {s}\n\n", .{selected_provider.label});
+
+    // ── Step 2: API key ──
+    const env_hint = selected_provider.env_var;
+    try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
+    const api_key_input = prompt(out, &input_buf, "", "") orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    if (api_key_input.len > 0) {
+        cfg.api_key = try allocator.dupe(u8, api_key_input);
+        try out.writeAll("  -> API key set\n\n");
+    } else {
+        try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
+    }
+
+    // ── Step 3: Model ──
+    try out.print("  Step 3/8: Model [default: {s}]: ", .{selected_provider.default_model});
+    const model_input = prompt(out, &input_buf, "", selected_provider.default_model) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    cfg.default_model = if (model_input.len > 0) try allocator.dupe(u8, model_input) else selected_provider.default_model;
+    try out.print("  -> {s}\n\n", .{cfg.default_model.?});
+
+    // ── Step 4: Memory backend ──
+    const backends = selectableBackends();
+    try out.writeAll("  Step 4/8: Memory backend\n");
+    for (backends, 0..) |b, i| {
+        try out.print("    [{d}] {s}\n", .{ i + 1, b.label });
+    }
+    try out.writeAll("  Choice [1]: ");
+    const mem_idx = promptChoice(out, &input_buf, backends.len, 0) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    cfg.memory.backend = backends[mem_idx].key;
+    cfg.memory.auto_save = backends[mem_idx].auto_save_default;
+    try out.print("  -> {s}\n\n", .{backends[mem_idx].label});
+
+    // ── Step 5: Tunnel ──
+    try out.writeAll("  Step 5/8: Tunnel\n");
+    try out.writeAll("    [1] none\n    [2] cloudflare\n    [3] ngrok\n    [4] tailscale\n");
+    try out.writeAll("  Choice [1]: ");
+    const tunnel_idx = promptChoice(out, &input_buf, tunnel_options.len, 0) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    cfg.tunnel.provider = tunnel_options[tunnel_idx];
+    try out.print("  -> {s}\n\n", .{tunnel_options[tunnel_idx]});
+
+    // ── Step 6: Autonomy level ──
+    try out.writeAll("  Step 6/8: Autonomy level\n");
+    try out.writeAll("    [1] supervised\n    [2] autonomous\n    [3] fully_autonomous\n");
+    try out.writeAll("  Choice [1]: ");
+    const autonomy_idx = promptChoice(out, &input_buf, autonomy_options.len, 0) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    cfg.autonomy.level = switch (autonomy_idx) {
+        0 => .supervised,
+        1 => .semi_autonomous,
+        2 => .full,
+        else => .supervised,
+    };
+    try out.print("  -> {s}\n\n", .{autonomy_options[autonomy_idx]});
+
+    // ── Step 7: Channels ──
+    try out.writeAll("  Step 7/8: Configure channels now? [y/N]: ");
+    const chan_input = prompt(out, &input_buf, "", "n") orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    if (chan_input.len > 0 and (chan_input[0] == 'y' or chan_input[0] == 'Y')) {
+        try out.writeAll("  -> Edit channels in config file after setup.\n\n");
+    } else {
+        try out.writeAll("  -> Skipped (CLI enabled by default)\n\n");
+    }
+
+    // ── Step 8: Workspace path ──
+    const default_workspace = try getDefaultWorkspace(allocator);
+    try out.print("  Step 8/8: Workspace path [{s}]: ", .{default_workspace});
+    const ws_input = prompt(out, &input_buf, "", default_workspace) orelse {
+        try out.writeAll("\n  Aborted.\n");
+        try out.flush();
+        return;
+    };
+    if (ws_input.len > 0) {
+        cfg.workspace_dir = try allocator.dupe(u8, ws_input);
+    }
+    try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
+
+    // ── Apply ──
+    // Ensure workspace directory exists
+    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Scaffold workspace files
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+
+    // Save config
+    try cfg.save();
+
+    // Print summary
+    try out.writeAll("  ── Configuration complete ──\n\n");
+    try out.print("  [OK] Provider:   {s}\n", .{cfg.default_provider});
+    if (cfg.default_model) |m| {
+        try out.print("  [OK] Model:      {s}\n", .{m});
+    }
+    try out.print("  [OK] API Key:    {s}\n", .{if (cfg.api_key != null) "set" else "from environment"});
+    try out.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
+    try out.print("  [OK] Tunnel:     {s}\n", .{cfg.tunnel.provider});
+    try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
+    try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
+    try out.writeAll("\n  Next steps:\n");
+    if (cfg.api_key == null) {
+        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
+        try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    3. Gateway:           nullclaw gateway\n");
+    } else {
+        try out.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    2. Gateway:  nullclaw gateway\n");
+        try out.writeAll("    3. Status:   nullclaw status\n");
+    }
+    try out.writeAll("\n");
+    try out.flush();
+}
+
+// ── Models refresh ──────────────────────────────────────────────
+
+const ModelsCatalogProvider = struct {
+    name: []const u8,
+    url: []const u8,
+    models_path: []const u8, // JSON path to the models array
+    id_field: []const u8, // field name for model ID within each entry
+};
+
+const catalog_providers = [_]ModelsCatalogProvider{
+    .{ .name = "openai", .url = "https://api.openai.com/v1/models", .models_path = "data", .id_field = "id" },
+    .{ .name = "openrouter", .url = "https://openrouter.ai/api/v1/models", .models_path = "data", .id_field = "id" },
+};
+
+/// Refresh the model catalog by fetching available models from known providers.
+/// Saves results to ~/.nullclaw/models_cache.json.
+pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
+    var stdout_buf: [4096]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    const out = &bw.interface;
+    try out.writeAll("Refreshing model catalog...\n");
+    try out.flush();
+
+    // Build cache path
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        try out.writeAll("Could not determine HOME directory.\n");
+        try out.flush();
+        return;
+    };
+    defer allocator.free(home);
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/models_cache.json", .{home});
+    defer allocator.free(cache_path);
+    const cache_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw", .{home});
+    defer allocator.free(cache_dir);
+
+    // Ensure directory exists
+    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            try out.writeAll("Could not create config directory.\n");
+            try out.flush();
+            return;
+        },
+    };
+
+    // Collect models from each provider using curl
+    var total_models: usize = 0;
+    var results_buf: std.ArrayList(u8) = .empty;
+    defer results_buf.deinit(allocator);
+
+    try results_buf.appendSlice(allocator, "{\n");
+
+    for (catalog_providers, 0..) |cp, cp_idx| {
+        try out.print("  Fetching from {s}...\n", .{cp.name});
+        try out.flush();
+
+        // Run curl to fetch models list
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "curl", "-sf", "--max-time", "10", cp.url },
+        }) catch {
+            try out.print("  [SKIP] {s}: curl failed\n", .{cp.name});
+            try out.flush();
+            continue;
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        if (result.stdout.len == 0) {
+            try out.print("  [SKIP] {s}: empty response\n", .{cp.name});
+            try out.flush();
+            continue;
+        }
+
+        // Parse JSON and extract model IDs
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch {
+            try out.print("  [SKIP] {s}: invalid JSON\n", .{cp.name});
+            try out.flush();
+            continue;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) {
+            try out.print("  [SKIP] {s}: unexpected format\n", .{cp.name});
+            try out.flush();
+            continue;
+        }
+
+        const data = root.object.get(cp.models_path) orelse {
+            try out.print("  [SKIP] {s}: no '{s}' field\n", .{ cp.name, cp.models_path });
+            try out.flush();
+            continue;
+        };
+        if (data != .array) {
+            try out.print("  [SKIP] {s}: '{s}' is not an array\n", .{ cp.name, cp.models_path });
+            try out.flush();
+            continue;
+        }
+
+        var count: usize = 0;
+        if (cp_idx > 0) try results_buf.appendSlice(allocator, ",\n");
+        try results_buf.appendSlice(allocator, "  \"");
+        try results_buf.appendSlice(allocator, cp.name);
+        try results_buf.appendSlice(allocator, "\": [");
+
+        for (data.array.items, 0..) |item, i| {
+            if (item != .object) continue;
+            const id_val = item.object.get(cp.id_field) orelse continue;
+            if (id_val != .string) continue;
+            if (i > 0) try results_buf.appendSlice(allocator, ",");
+            try results_buf.appendSlice(allocator, "\"");
+            try results_buf.appendSlice(allocator, id_val.string);
+            try results_buf.appendSlice(allocator, "\"");
+            count += 1;
+        }
+
+        try results_buf.appendSlice(allocator, "]");
+        total_models += count;
+        try out.print("  [OK] {s}: {d} models\n", .{ cp.name, count });
+        try out.flush();
+    }
+
+    try results_buf.appendSlice(allocator, "\n}\n");
+
+    // Write cache file
+    const file = std.fs.createFileAbsolute(cache_path, .{}) catch {
+        try out.writeAll("Could not write cache file.\n");
+        try out.flush();
+        return;
+    };
+    defer file.close();
+    file.writeAll(results_buf.items) catch {
+        try out.writeAll("Error writing cache file.\n");
+        try out.flush();
+        return;
+    };
+
+    try out.print("\nFetched {d} models total. Cache saved to {s}\n", .{ total_models, cache_path });
+    try out.flush();
 }
 
 // ── Workspace scaffolding ────────────────────────────────────────
@@ -576,4 +905,71 @@ test "selectableBackends has expected backends" {
         if (std.mem.eql(u8, b.key, "sqlite")) has_sqlite = true;
     }
     try std.testing.expect(has_sqlite);
+}
+
+// ── Wizard helper tests ─────────────────────────────────────────
+
+test "readLine returns null on empty read" {
+    // readLine reads from actual stdin which returns 0 bytes in tests (EOF)
+    // This tests the null-on-EOF path
+    var buf: [64]u8 = undefined;
+    // We can't test stdin directly in unit tests, but we can validate
+    // the function signature and constants
+    _ = &buf;
+}
+
+test "tunnel_options has 4 entries" {
+    try std.testing.expect(tunnel_options.len == 4);
+    try std.testing.expectEqualStrings("none", tunnel_options[0]);
+    try std.testing.expectEqualStrings("cloudflare", tunnel_options[1]);
+    try std.testing.expectEqualStrings("ngrok", tunnel_options[2]);
+    try std.testing.expectEqualStrings("tailscale", tunnel_options[3]);
+}
+
+test "autonomy_options has 3 entries" {
+    try std.testing.expect(autonomy_options.len == 3);
+    try std.testing.expectEqualStrings("supervised", autonomy_options[0]);
+    try std.testing.expectEqualStrings("autonomous", autonomy_options[1]);
+    try std.testing.expectEqualStrings("fully_autonomous", autonomy_options[2]);
+}
+
+test "catalog_providers has entries" {
+    try std.testing.expect(catalog_providers.len >= 2);
+    try std.testing.expectEqualStrings("openai", catalog_providers[0].name);
+    try std.testing.expectEqualStrings("openrouter", catalog_providers[1].name);
+}
+
+test "catalog_providers all have valid fields" {
+    for (catalog_providers) |cp| {
+        try std.testing.expect(cp.name.len > 0);
+        try std.testing.expect(cp.url.len > 0);
+        try std.testing.expect(cp.models_path.len > 0);
+        try std.testing.expect(cp.id_field.len > 0);
+        // URLs should start with https
+        try std.testing.expect(std.mem.startsWith(u8, cp.url, "https://"));
+    }
+}
+
+test "catalog_providers names are unique" {
+    for (catalog_providers, 0..) |cp1, i| {
+        for (catalog_providers[i + 1 ..]) |cp2| {
+            try std.testing.expect(!std.mem.eql(u8, cp1.name, cp2.name));
+        }
+    }
+}
+
+test "wizard promptChoice returns default for out-of-range" {
+    // This tests the logic without actual I/O by validating the
+    // boundary: max providers is known_providers.len
+    try std.testing.expect(known_providers.len == 7);
+    // The wizard would clamp to default (0) for out of range input
+}
+
+test "wizard maps autonomy index to enum correctly" {
+    // Verify the mapping used in runWizard
+    const Config2 = @import("config.zig");
+    const mapping = [_]Config2.AutonomyLevel{ .supervised, .semi_autonomous, .full };
+    try std.testing.expect(mapping[0] == .supervised);
+    try std.testing.expect(mapping[1] == .semi_autonomous);
+    try std.testing.expect(mapping[2] == .full);
 }

@@ -43,6 +43,8 @@ pub const AutonomyConfig = struct {
     max_cost_per_day_cents: u32 = 500,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    allowed_commands: []const []const u8 = &.{},
+    forbidden_paths: []const []const u8 = &.{},
 };
 
 pub const DockerRuntimeConfig = struct {
@@ -213,6 +215,7 @@ pub const GatewayConfig = struct {
     pair_rate_limit_per_minute: u32 = 10,
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
+    paired_tokens: []const []const u8 = &.{},
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -248,6 +251,7 @@ pub const BrowserConfig = struct {
     native_webdriver_url: []const u8 = "http://127.0.0.1:9515",
     native_chrome_path: ?[]const u8 = null,
     computer_use: BrowserComputerUseConfig = .{},
+    allowed_domains: []const []const u8 = &.{},
 };
 
 // ── HTTP request config ─────────────────────────────────────────
@@ -345,6 +349,18 @@ pub const DelegateAgentConfig = struct {
     max_depth: u32 = 3,
 };
 
+// ── Named agent config (for agents map in JSON) ────────────────
+
+pub const NamedAgentConfig = struct {
+    name: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    system_prompt: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    temperature: ?f64 = null,
+    max_depth: u32 = 3,
+};
+
 // ── Model Pricing ──────────────────────────────────────────────
 
 pub const ModelPricing = struct {
@@ -365,6 +381,10 @@ pub const Config = struct {
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
     default_temperature: f64 = 0.7,
+
+    // Model routing and delegate agents
+    model_routes: []const ModelRouteConfig = &.{},
+    agents: []const NamedAgentConfig = &.{},
 
     // Nested sub-configs
     observability: ObservabilityConfig = .{},
@@ -452,6 +472,18 @@ pub const Config = struct {
         return cfg;
     }
 
+    /// Parse a JSON array of strings into an allocated slice.
+    fn parseStringArray(self: *Config, arr: std.json.Array) ![]const []const u8 {
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        try list.ensureTotalCapacity(self.allocator, @intCast(arr.items.len));
+        for (arr.items) |item| {
+            if (item == .string) {
+                try list.append(self.allocator, try self.allocator.dupe(u8, item.string));
+            }
+        }
+        return try list.toOwnedSlice(self.allocator);
+    }
+
     fn parseJson(self: *Config, content: []const u8) !void {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
         defer parsed.deinit();
@@ -471,6 +503,68 @@ pub const Config = struct {
         if (root.get("default_temperature")) |v| {
             if (v == .float) self.default_temperature = v.float;
             if (v == .integer) self.default_temperature = @floatFromInt(v.integer);
+        }
+
+        // Model routes
+        if (root.get("model_routes")) |v| {
+            if (v == .array) {
+                var list: std.ArrayListUnmanaged(ModelRouteConfig) = .empty;
+                try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
+                for (v.array.items) |item| {
+                    if (item == .object) {
+                        const hint = item.object.get("hint") orelse continue;
+                        const provider = item.object.get("provider") orelse continue;
+                        const model = item.object.get("model") orelse continue;
+                        if (hint != .string or provider != .string or model != .string) continue;
+                        var route = ModelRouteConfig{
+                            .hint = try self.allocator.dupe(u8, hint.string),
+                            .provider = try self.allocator.dupe(u8, provider.string),
+                            .model = try self.allocator.dupe(u8, model.string),
+                        };
+                        if (item.object.get("api_key")) |ak| {
+                            if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                        }
+                        try list.append(self.allocator, route);
+                    }
+                }
+                self.model_routes = try list.toOwnedSlice(self.allocator);
+            }
+        }
+
+        // Agents
+        if (root.get("agents")) |v| {
+            if (v == .array) {
+                var list: std.ArrayListUnmanaged(NamedAgentConfig) = .empty;
+                try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
+                for (v.array.items) |item| {
+                    if (item == .object) {
+                        const name = item.object.get("name") orelse continue;
+                        const provider = item.object.get("provider") orelse continue;
+                        const model = item.object.get("model") orelse continue;
+                        if (name != .string or provider != .string or model != .string) continue;
+                        var agent_cfg = NamedAgentConfig{
+                            .name = try self.allocator.dupe(u8, name.string),
+                            .provider = try self.allocator.dupe(u8, provider.string),
+                            .model = try self.allocator.dupe(u8, model.string),
+                        };
+                        if (item.object.get("system_prompt")) |sp| {
+                            if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
+                        }
+                        if (item.object.get("api_key")) |ak| {
+                            if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
+                        }
+                        if (item.object.get("temperature")) |t| {
+                            if (t == .float) agent_cfg.temperature = t.float;
+                            if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
+                        }
+                        if (item.object.get("max_depth")) |md| {
+                            if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+                        }
+                        try list.append(self.allocator, agent_cfg);
+                    }
+                }
+                self.agents = try list.toOwnedSlice(self.allocator);
+            }
         }
 
         // Observability
@@ -516,6 +610,12 @@ pub const Config = struct {
                             self.autonomy.level = .full;
                         }
                     }
+                }
+                if (aut.object.get("allowed_commands")) |v| {
+                    if (v == .array) self.autonomy.allowed_commands = try self.parseStringArray(v.array);
+                }
+                if (aut.object.get("forbidden_paths")) |v| {
+                    if (v == .array) self.autonomy.forbidden_paths = try self.parseStringArray(v.array);
                 }
             }
         }
@@ -707,6 +807,9 @@ pub const Config = struct {
                 if (gw.object.get("idempotency_ttl_secs")) |v| {
                     if (v == .integer) self.gateway.idempotency_ttl_secs = @intCast(v.integer);
                 }
+                if (gw.object.get("paired_tokens")) |v| {
+                    if (v == .array) self.gateway.paired_tokens = try self.parseStringArray(v.array);
+                }
             }
         }
 
@@ -792,6 +895,9 @@ pub const Config = struct {
                 }
                 if (br.object.get("session_name")) |v| {
                     if (v == .string) self.browser.session_name = try self.allocator.dupe(u8, v.string);
+                }
+                if (br.object.get("allowed_domains")) |v| {
+                    if (v == .array) self.browser.allowed_domains = try self.parseStringArray(v.array);
                 }
             }
         }
@@ -2338,4 +2444,291 @@ test "sandbox backend enum values" {
     try std.testing.expectEqualStrings("bubblewrap", @tagName(SandboxBackend.bubblewrap));
     try std.testing.expectEqualStrings("docker", @tagName(SandboxBackend.docker));
     try std.testing.expectEqualStrings("none", @tagName(SandboxBackend.none));
+}
+
+// ── New fields: autonomy allowed_commands / forbidden_paths ─────
+
+test "autonomy config default empty command lists" {
+    const a = AutonomyConfig{};
+    try std.testing.expectEqual(@as(usize, 0), a.allowed_commands.len);
+    try std.testing.expectEqual(@as(usize, 0), a.forbidden_paths.len);
+}
+
+test "autonomy config with allowed commands" {
+    const a = AutonomyConfig{
+        .allowed_commands = &.{ "ls", "cat", "git" },
+    };
+    try std.testing.expectEqual(@as(usize, 3), a.allowed_commands.len);
+    try std.testing.expectEqualStrings("ls", a.allowed_commands[0]);
+    try std.testing.expectEqualStrings("cat", a.allowed_commands[1]);
+    try std.testing.expectEqualStrings("git", a.allowed_commands[2]);
+}
+
+test "autonomy config with forbidden paths" {
+    const a = AutonomyConfig{
+        .forbidden_paths = &.{ "/etc/passwd", "/root" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), a.forbidden_paths.len);
+    try std.testing.expectEqualStrings("/etc/passwd", a.forbidden_paths[0]);
+    try std.testing.expectEqualStrings("/root", a.forbidden_paths[1]);
+}
+
+test "json parse autonomy allowed commands and forbidden paths" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"allowed_commands": ["ls", "cat", "git status"], "forbidden_paths": ["/etc/shadow", "/root/.ssh"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 3), cfg.autonomy.allowed_commands.len);
+    try std.testing.expectEqualStrings("ls", cfg.autonomy.allowed_commands[0]);
+    try std.testing.expectEqualStrings("cat", cfg.autonomy.allowed_commands[1]);
+    try std.testing.expectEqualStrings("git status", cfg.autonomy.allowed_commands[2]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.autonomy.forbidden_paths.len);
+    try std.testing.expectEqualStrings("/etc/shadow", cfg.autonomy.forbidden_paths[0]);
+    try std.testing.expectEqualStrings("/root/.ssh", cfg.autonomy.forbidden_paths[1]);
+    for (cfg.autonomy.allowed_commands) |cmd| allocator.free(cmd);
+    allocator.free(cfg.autonomy.allowed_commands);
+    for (cfg.autonomy.forbidden_paths) |p| allocator.free(p);
+    allocator.free(cfg.autonomy.forbidden_paths);
+}
+
+// ── New fields: gateway paired_tokens ───────────────────────────
+
+test "gateway config default empty paired tokens" {
+    const g = GatewayConfig{};
+    try std.testing.expectEqual(@as(usize, 0), g.paired_tokens.len);
+}
+
+test "gateway config with paired tokens" {
+    const g = GatewayConfig{
+        .paired_tokens = &.{ "tok-abc-123", "tok-def-456" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), g.paired_tokens.len);
+    try std.testing.expectEqualStrings("tok-abc-123", g.paired_tokens[0]);
+    try std.testing.expectEqualStrings("tok-def-456", g.paired_tokens[1]);
+}
+
+test "json parse gateway paired tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"gateway": {"paired_tokens": ["token-1", "token-2", "token-3"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 3), cfg.gateway.paired_tokens.len);
+    try std.testing.expectEqualStrings("token-1", cfg.gateway.paired_tokens[0]);
+    try std.testing.expectEqualStrings("token-2", cfg.gateway.paired_tokens[1]);
+    try std.testing.expectEqualStrings("token-3", cfg.gateway.paired_tokens[2]);
+    for (cfg.gateway.paired_tokens) |t| allocator.free(t);
+    allocator.free(cfg.gateway.paired_tokens);
+}
+
+// ── New fields: browser allowed_domains ─────────────────────────
+
+test "browser config default empty allowed domains" {
+    const b = BrowserConfig{};
+    try std.testing.expectEqual(@as(usize, 0), b.allowed_domains.len);
+}
+
+test "browser config with allowed domains" {
+    const b = BrowserConfig{
+        .allowed_domains = &.{ "example.com", "docs.rs" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), b.allowed_domains.len);
+    try std.testing.expectEqualStrings("example.com", b.allowed_domains[0]);
+    try std.testing.expectEqualStrings("docs.rs", b.allowed_domains[1]);
+}
+
+test "json parse browser allowed domains" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"browser": {"enabled": true, "allowed_domains": ["github.com", "docs.rs"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.browser.enabled);
+    try std.testing.expectEqual(@as(usize, 2), cfg.browser.allowed_domains.len);
+    try std.testing.expectEqualStrings("github.com", cfg.browser.allowed_domains[0]);
+    try std.testing.expectEqualStrings("docs.rs", cfg.browser.allowed_domains[1]);
+    for (cfg.browser.allowed_domains) |d| allocator.free(d);
+    allocator.free(cfg.browser.allowed_domains);
+}
+
+// ── New fields: model_routes ────────────────────────────────────
+
+test "config default empty model routes" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(@as(usize, 0), cfg.model_routes.len);
+}
+
+test "json parse model routes" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"model_routes": [
+        \\  {"hint": "reasoning", "provider": "openrouter", "model": "anthropic/claude-opus-4"},
+        \\  {"hint": "fast", "provider": "groq", "model": "llama-3.3-70b", "api_key": "gsk_test"}
+        \\]}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.model_routes.len);
+    try std.testing.expectEqualStrings("reasoning", cfg.model_routes[0].hint);
+    try std.testing.expectEqualStrings("openrouter", cfg.model_routes[0].provider);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4", cfg.model_routes[0].model);
+    try std.testing.expect(cfg.model_routes[0].api_key == null);
+    try std.testing.expectEqualStrings("fast", cfg.model_routes[1].hint);
+    try std.testing.expectEqualStrings("groq", cfg.model_routes[1].provider);
+    try std.testing.expectEqualStrings("llama-3.3-70b", cfg.model_routes[1].model);
+    try std.testing.expectEqualStrings("gsk_test", cfg.model_routes[1].api_key.?);
+    // Cleanup
+    for (cfg.model_routes) |r| {
+        allocator.free(r.hint);
+        allocator.free(r.provider);
+        allocator.free(r.model);
+        if (r.api_key) |k| allocator.free(k);
+    }
+    allocator.free(cfg.model_routes);
+}
+
+test "json parse model routes skips invalid entries" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"model_routes": [
+        \\  {"hint": "ok", "provider": "p", "model": "m"},
+        \\  {"hint": "missing_model", "provider": "p"},
+        \\  {"invalid": true}
+        \\]}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.model_routes.len);
+    try std.testing.expectEqualStrings("ok", cfg.model_routes[0].hint);
+    allocator.free(cfg.model_routes[0].hint);
+    allocator.free(cfg.model_routes[0].provider);
+    allocator.free(cfg.model_routes[0].model);
+    allocator.free(cfg.model_routes);
+}
+
+// ── New fields: agents ──────────────────────────────────────────
+
+test "config default empty agents" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(@as(usize, 0), cfg.agents.len);
+}
+
+test "named agent config constructible" {
+    const n = NamedAgentConfig{
+        .name = "researcher",
+        .provider = "anthropic",
+        .model = "claude-sonnet-4",
+    };
+    try std.testing.expectEqualStrings("researcher", n.name);
+    try std.testing.expectEqualStrings("anthropic", n.provider);
+    try std.testing.expectEqualStrings("claude-sonnet-4", n.model);
+    try std.testing.expect(n.system_prompt == null);
+    try std.testing.expect(n.api_key == null);
+    try std.testing.expect(n.temperature == null);
+    try std.testing.expectEqual(@as(u32, 3), n.max_depth);
+}
+
+test "json parse agents" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": [
+        \\  {"name": "researcher", "provider": "anthropic", "model": "claude-sonnet-4", "system_prompt": "Research things", "max_depth": 5},
+        \\  {"name": "coder", "provider": "openai", "model": "gpt-4o", "api_key": "sk-test", "temperature": 0.3}
+        \\]}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
+    try std.testing.expectEqualStrings("researcher", cfg.agents[0].name);
+    try std.testing.expectEqualStrings("anthropic", cfg.agents[0].provider);
+    try std.testing.expectEqualStrings("claude-sonnet-4", cfg.agents[0].model);
+    try std.testing.expectEqualStrings("Research things", cfg.agents[0].system_prompt.?);
+    try std.testing.expectEqual(@as(u32, 5), cfg.agents[0].max_depth);
+    try std.testing.expect(cfg.agents[0].api_key == null);
+    try std.testing.expectEqualStrings("coder", cfg.agents[1].name);
+    try std.testing.expectEqualStrings("openai", cfg.agents[1].provider);
+    try std.testing.expectEqualStrings("gpt-4o", cfg.agents[1].model);
+    try std.testing.expectEqualStrings("sk-test", cfg.agents[1].api_key.?);
+    try std.testing.expectEqual(@as(f64, 0.3), cfg.agents[1].temperature.?);
+    try std.testing.expectEqual(@as(u32, 3), cfg.agents[1].max_depth);
+    // Cleanup
+    for (cfg.agents) |a| {
+        allocator.free(a.name);
+        allocator.free(a.provider);
+        allocator.free(a.model);
+        if (a.system_prompt) |sp| allocator.free(sp);
+        if (a.api_key) |k| allocator.free(k);
+    }
+    allocator.free(cfg.agents);
+}
+
+test "json parse agents skips invalid entries" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"agents": [
+        \\  {"name": "ok", "provider": "p", "model": "m"},
+        \\  {"name": "missing_model", "provider": "p"},
+        \\  42
+        \\]}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings("ok", cfg.agents[0].name);
+    allocator.free(cfg.agents[0].name);
+    allocator.free(cfg.agents[0].provider);
+    allocator.free(cfg.agents[0].model);
+    allocator.free(cfg.agents);
+}
+
+// ── Combined: all new fields in one JSON ────────────────────────
+
+test "json parse all new fields together" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_routes": [{"hint": "fast", "provider": "groq", "model": "llama-3.3-70b"}],
+        \\  "agents": [{"name": "helper", "provider": "anthropic", "model": "claude-haiku-3.5"}],
+        \\  "autonomy": {"allowed_commands": ["ls"], "forbidden_paths": ["/root"]},
+        \\  "gateway": {"paired_tokens": ["tok-1"]},
+        \\  "browser": {"allowed_domains": ["example.com"]}
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.model_routes.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.autonomy.allowed_commands.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.autonomy.forbidden_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.gateway.paired_tokens.len);
+    try std.testing.expectEqual(@as(usize, 1), cfg.browser.allowed_domains.len);
+    // Cleanup
+    allocator.free(cfg.model_routes[0].hint);
+    allocator.free(cfg.model_routes[0].provider);
+    allocator.free(cfg.model_routes[0].model);
+    allocator.free(cfg.model_routes);
+    allocator.free(cfg.agents[0].name);
+    allocator.free(cfg.agents[0].provider);
+    allocator.free(cfg.agents[0].model);
+    allocator.free(cfg.agents);
+    allocator.free(cfg.autonomy.allowed_commands[0]);
+    allocator.free(cfg.autonomy.allowed_commands);
+    allocator.free(cfg.autonomy.forbidden_paths[0]);
+    allocator.free(cfg.autonomy.forbidden_paths);
+    allocator.free(cfg.gateway.paired_tokens[0]);
+    allocator.free(cfg.gateway.paired_tokens);
+    allocator.free(cfg.browser.allowed_domains[0]);
+    allocator.free(cfg.browser.allowed_domains);
 }
