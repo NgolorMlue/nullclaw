@@ -408,6 +408,11 @@ pub fn attemptPairing(guard: *PairingGuard, pairing_code: ?[]const u8) PairAttem
     return .invalid_code;
 }
 
+/// Format the /pair success payload. Returns null when buffer is too small.
+pub fn formatPairSuccessResponse(buf: []u8, token: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
+}
+
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ac, bc| {
@@ -779,6 +784,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const is_post = std.mem.eql(u8, method_str, "POST");
         var response_status: []const u8 = "200 OK";
         var response_body: []const u8 = "";
+        var pair_response_buf: [256]u8 = undefined;
 
         if (std.mem.eql(u8, target, "/health") or std.mem.startsWith(u8, target, "/health?")) {
             response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -842,8 +848,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                     switch (attemptPairing(guard, pairing_code)) {
                         .paired => |token| {
                             defer allocator.free(token);
-                            const pair_resp = std.fmt.allocPrint(req_allocator, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
-                            response_body = pair_resp orelse "{\"status\":\"paired\"}";
+                            if (formatPairSuccessResponse(&pair_response_buf, token)) |pair_resp| {
+                                response_body = pair_resp;
+                            } else {
+                                response_status = "500 Internal Server Error";
+                                response_body = "{\"error\":\"pairing response failed\"}";
+                            }
                         },
                         .missing_code => {
                             response_status = "400 Bad Request";
@@ -1324,6 +1334,20 @@ test "attemptPairing reports disabled when pairing is off" {
 
     const result = attemptPairing(&guard, "123456");
     try std.testing.expect(result == .disabled);
+}
+
+test "formatPairSuccessResponse includes paired token" {
+    var buf: [256]u8 = undefined;
+    const response = formatPairSuccessResponse(&buf, "zc_token_123") orelse unreachable;
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"paired\",\"token\":\"zc_token_123\"}",
+        response,
+    );
+}
+
+test "formatPairSuccessResponse fails when buffer is too small" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123") == null);
 }
 
 // ── extractHeader tests ──────────────────────────────────────────
