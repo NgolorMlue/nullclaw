@@ -52,6 +52,8 @@ pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
+pub const ProviderEntry = config_types.ProviderEntry;
+pub const TranscriptionConfig = config_types.TranscriptionConfig;
 
 // ── Top-level Config ────────────────────────────────────────────
 
@@ -61,9 +63,8 @@ pub const Config = struct {
     config_path: []const u8,
 
     // Top-level fields
-    api_key: ?[]const u8 = null,
-    api_url: ?[]const u8 = null,
-    groq_api_key: ?[]const u8 = null,
+    providers: []const ProviderEntry = &.{},
+    transcription: TranscriptionConfig = .{},
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
     default_temperature: f64 = 0.7,
@@ -111,6 +112,27 @@ pub const Config = struct {
     max_actions_per_hour: u32 = 20,
 
     allocator: std.mem.Allocator,
+
+    /// Look up a provider's API key from the providers list.
+    pub fn getProviderKey(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.api_key;
+        }
+        return null;
+    }
+
+    /// Convenience: API key for the default_provider.
+    pub fn defaultProviderKey(self: *const Config) ?[]const u8 {
+        return self.getProviderKey(self.default_provider);
+    }
+
+    /// Look up a provider's api_base from the providers list.
+    pub fn getProviderBase(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.api_base;
+        }
+        return null;
+    }
 
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
@@ -172,11 +194,6 @@ pub const Config = struct {
 
     /// Apply NULLCLAW_* environment variable overrides.
     pub fn applyEnvOverrides(self: *Config) void {
-        // API Key
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_API_KEY")) |key| {
-            self.api_key = key;
-        } else |_| {}
-
         // Provider
         if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_PROVIDER")) |prov| {
             self.default_provider = prov;
@@ -220,11 +237,6 @@ pub const Config = struct {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else |_| {}
-
-        // Base URL (maps to api_url)
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_BASE_URL")) |url| {
-            self.api_url = url;
-        } else |_| {}
     }
 
     /// Save config as JSON to the config_path.
@@ -247,17 +259,52 @@ pub const Config = struct {
         try w.print("{{\n", .{});
 
         // Top-level fields
-        if (self.api_key) |key| {
-            try w.print("  \"api_key\": \"{s}\",\n", .{key});
-        }
-        if (self.groq_api_key) |key| {
-            try w.print("  \"groq_api_key\": \"{s}\",\n", .{key});
-        }
         try w.print("  \"default_provider\": \"{s}\",\n", .{self.default_provider});
         if (self.default_model) |model| {
             try w.print("  \"default_model\": \"{s}\",\n", .{model});
         }
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
+
+        // Providers
+        if (self.providers.len > 0) {
+            try w.print("  \"providers\": {{\n", .{});
+            for (self.providers, 0..) |entry, i| {
+                try w.print("    \"{s}\": {{", .{entry.name});
+                var has_field = false;
+                if (entry.api_key) |key| {
+                    try w.print("\"api_key\": \"{s}\"", .{key});
+                    has_field = true;
+                }
+                if (entry.api_base) |base| {
+                    if (has_field) try w.print(", ", .{});
+                    try w.print("\"api_base\": \"{s}\"", .{base});
+                }
+                try w.print("}}", .{});
+                if (i + 1 < self.providers.len) try w.print(",", .{});
+                try w.print("\n", .{});
+            }
+            try w.print("  }},\n", .{});
+        }
+
+        // Transcription
+        {
+            const t = self.transcription;
+            const is_default = std.mem.eql(u8, t.provider, "groq") and
+                std.mem.eql(u8, t.model, "whisper-large-v3") and
+                t.endpoint == null and t.language == null;
+            if (!is_default) {
+                try w.print("  \"transcription\": {{\n", .{});
+                try w.print("    \"provider\": \"{s}\",\n", .{t.provider});
+                try w.print("    \"model\": \"{s}\"", .{t.model});
+                if (t.endpoint) |ep| {
+                    try w.print(",\n    \"endpoint\": \"{s}\"", .{ep});
+                }
+                if (t.language) |lang| {
+                    try w.print(",\n    \"language\": \"{s}\"", .{lang});
+                }
+                try w.print("\n  }},\n", .{});
+            }
+        }
 
         // Observability
         try w.print("  \"observability\": {{\n", .{});
@@ -378,7 +425,7 @@ test "json parse roundtrip" {
         \\  "default_provider": "anthropic",
         \\  "default_model": "claude-opus-4",
         \\  "default_temperature": 0.5,
-        \\  "api_key": "sk-test",
+        \\  "providers": {"anthropic": {"api_key": "sk-test"}},
         \\  "heartbeat": {"enabled": true, "interval_minutes": 15},
         \\  "memory": {"backend": "markdown", "auto_save": false},
         \\  "gateway": {"port": 9090, "host": "0.0.0.0"},
@@ -400,7 +447,7 @@ test "json parse roundtrip" {
     try std.testing.expectEqualStrings("claude-opus-4", cfg.default_model.?);
     try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
     try std.testing.expectEqual(@as(f64, 0.5), cfg.temperature);
-    try std.testing.expectEqualStrings("sk-test", cfg.api_key.?);
+    try std.testing.expectEqualStrings("sk-test", cfg.defaultProviderKey().?);
     try std.testing.expect(cfg.heartbeat.enabled);
     try std.testing.expect(cfg.heartbeat_enabled);
     try std.testing.expectEqual(@as(u32, 15), cfg.heartbeat.interval_minutes);
@@ -421,7 +468,12 @@ test "json parse roundtrip" {
     // Clean up allocated strings
     allocator.free(cfg.default_provider);
     allocator.free(cfg.default_model.?);
-    allocator.free(cfg.api_key.?);
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
     allocator.free(cfg.memory.backend);
     allocator.free(cfg.gateway.host);
     allocator.free(cfg.runtime.kind);
@@ -921,15 +973,43 @@ test "json parse all new fields together" {
     allocator.free(cfg.browser.allowed_domains);
 }
 
-test "json parse api_url" {
+test "legacy api_key auto-migrates to providers" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"api_url": "http://10.0.0.1:11434"}
+        \\{"default_provider": "openai", "api_key": "sk-legacy"}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqualStrings("http://10.0.0.1:11434", cfg.api_url.?);
-    allocator.free(cfg.api_url.?);
+    // Legacy api_key should be migrated into providers for default_provider
+    try std.testing.expectEqualStrings("sk-legacy", cfg.defaultProviderKey().?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("openai", cfg.providers[0].name);
+    // Cleanup
+    allocator.free(cfg.default_provider);
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
+}
+
+test "legacy api_url auto-migrates to providers" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"default_provider": "ollama", "api_url": "http://10.0.0.1:11434"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("http://10.0.0.1:11434", cfg.getProviderBase("ollama").?);
+    // Cleanup
+    allocator.free(cfg.default_provider);
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
 }
 
 // ── Environment variable override tests ─────────────────────────
@@ -946,8 +1026,7 @@ test "applyEnvOverrides does not crash on default config" {
     // Default values should remain intact
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", cfg.default_model.?);
-    try std.testing.expect(cfg.api_key == null);
-    try std.testing.expect(cfg.api_url == null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }
 
 test "json parse mcp_servers" {
@@ -1041,22 +1120,120 @@ test "json parse mcp_servers with env" {
     allocator.free(cfg.mcp_servers);
 }
 
-test "json parse groq_api_key" {
+test "json parse providers section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"providers": {"openrouter": {"api_key": "sk-or-abc"}, "groq": {"api_key": "gsk_123", "api_base": "https://custom.groq.dev"}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("sk-or-abc", cfg.getProviderKey("openrouter").?);
+    try std.testing.expectEqualStrings("gsk_123", cfg.getProviderKey("groq").?);
+    try std.testing.expectEqualStrings("https://custom.groq.dev", cfg.getProviderBase("groq").?);
+    try std.testing.expect(cfg.getProviderBase("openrouter") == null);
+    // Cleanup
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
+}
+
+test "json parse transcription section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"transcription": {"provider": "openai", "model": "whisper-1", "endpoint": "https://api.openai.com/v1/audio/transcriptions", "language": "en"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("openai", cfg.transcription.provider);
+    try std.testing.expectEqualStrings("whisper-1", cfg.transcription.model);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", cfg.transcription.endpoint.?);
+    try std.testing.expectEqualStrings("en", cfg.transcription.language.?);
+    allocator.free(cfg.transcription.provider);
+    allocator.free(cfg.transcription.model);
+    allocator.free(cfg.transcription.endpoint.?);
+    allocator.free(cfg.transcription.language.?);
+}
+
+test "getProviderKey returns null for missing provider" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(cfg.getProviderKey("nonexistent") == null);
+    try std.testing.expect(cfg.defaultProviderKey() == null);
+}
+
+test "providers defaults to empty" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
+}
+
+test "transcription defaults" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqualStrings("groq", cfg.transcription.provider);
+    try std.testing.expectEqualStrings("whisper-large-v3", cfg.transcription.model);
+    try std.testing.expect(cfg.transcription.endpoint == null);
+    try std.testing.expect(cfg.transcription.language == null);
+}
+
+test "defaultProviderKey returns key for default provider" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"default_provider": "groq", "providers": {"groq": {"api_key": "gsk_found"}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("gsk_found", cfg.defaultProviderKey().?);
+    // Cleanup
+    allocator.free(cfg.default_provider);
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
+}
+
+test "transcription with language parses correctly" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"transcription": {"language": "ru"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("ru", cfg.transcription.language.?);
+    // provider/model remain defaults (string literals, not allocated)
+    try std.testing.expectEqualStrings("groq", cfg.transcription.provider);
+    try std.testing.expectEqualStrings("whisper-large-v3", cfg.transcription.model);
+    allocator.free(cfg.transcription.language.?);
+}
+
+test "legacy groq_api_key auto-migrates to providers" {
     const allocator = std.testing.allocator;
     const json =
         \\{"groq_api_key": "gsk_test_abc123"}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqualStrings("gsk_test_abc123", cfg.groq_api_key.?);
-    allocator.free(cfg.groq_api_key.?);
-}
-
-test "groq_api_key defaults to null" {
-    const cfg = Config{
-        .workspace_dir = "/tmp/yc",
-        .config_path = "/tmp/yc/config.json",
-        .allocator = std.testing.allocator,
-    };
-    try std.testing.expect(cfg.groq_api_key == null);
+    try std.testing.expectEqualStrings("gsk_test_abc123", cfg.getProviderKey("groq").?);
+    // Cleanup
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.api_base) |b| allocator.free(b);
+    }
+    allocator.free(cfg.providers);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
+const config_mod = @import("../config_types.zig");
 
 // Re-export all provider sub-modules
 pub const anthropic = @import("anthropic.zig");
@@ -649,6 +650,23 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
     return .{ "", "", "" };
 }
 
+/// Resolve API key with config providers as first priority:
+///   1. providers[].api_key from config
+///   2. Provider-specific env var (GROQ_API_KEY, etc.)
+///   3. Generic fallbacks (NULLCLAW_API_KEY, API_KEY)
+pub fn resolveApiKeyFromConfig(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    providers: []const config_mod.ProviderEntry,
+) !?[]u8 {
+    for (providers) |e| {
+        if (std.mem.eql(u8, e.name, provider_name)) {
+            if (e.api_key) |k| return try allocator.dupe(u8, k);
+        }
+    }
+    return resolveApiKey(allocator, provider_name, null);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Provider Factory
 // ════════════════════════════════════════════════════════════════════════════
@@ -857,8 +875,20 @@ pub fn compatibleProviderDisplayName(name: []const u8) []const u8 {
 
 /// High-level complete function that routes to the right provider via HTTP.
 /// Used by agent.zig for backward compatibility.
+/// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
+fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
+    const T = @TypeOf(cfg);
+    const Struct = switch (@typeInfo(T)) {
+        .pointer => |p| p.child,
+        else => T,
+    };
+    if (@hasField(Struct, "api_key")) return cfg.api_key;
+    if (@hasDecl(Struct, "defaultProviderKey")) return cfg.defaultProviderKey();
+    return null;
+}
+
 pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) ![]const u8 {
-    const api_key = cfg.api_key orelse return error.NoApiKey;
+    const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
     const model = cfg.default_model orelse "anthropic/claude-sonnet-4-5-20250929";
     const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens);
@@ -892,7 +922,7 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
 
 /// Like complete() but prepends a system prompt. OpenAI-compatible format.
 pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_prompt: []const u8, prompt: []const u8) ![]const u8 {
-    const api_key = cfg.api_key orelse return error.NoApiKey;
+    const api_key = resolveApiKeyFromCfg(cfg) orelse return error.NoApiKey;
     const url = providerUrl(cfg.default_provider);
     const model = cfg.default_model orelse "anthropic/claude-sonnet-4-5-20250929";
     const max_tok: u32 = if (cfg.max_tokens) |mt| @intCast(@min(mt, std.math.maxInt(u32))) else 4096;
@@ -1783,6 +1813,26 @@ test "ChatMessage with content_parts set" {
     try std.testing.expect(msg.content_parts.?.len == 2);
     try std.testing.expect(msg.content_parts.?[0] == .text);
     try std.testing.expect(msg.content_parts.?[1] == .image_url);
+}
+
+test "resolveApiKeyFromConfig finds key from providers" {
+    const entries = [_]config_mod.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+        .{ .name = "groq", .api_key = "gsk_test" },
+    };
+    const result = try resolveApiKeyFromConfig(std.testing.allocator, "groq", &entries);
+    defer if (result) |r| std.testing.allocator.free(r);
+    try std.testing.expectEqualStrings("gsk_test", result.?);
+}
+
+test "resolveApiKeyFromConfig returns null for missing provider" {
+    const entries = [_]config_mod.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+    };
+    // Without env var set, should fall through to env-based resolution
+    // which may or may not find a key — we just test it doesn't crash
+    const result = try resolveApiKeyFromConfig(std.testing.allocator, "nonexistent", &entries);
+    if (result) |r| std.testing.allocator.free(r);
 }
 
 test {

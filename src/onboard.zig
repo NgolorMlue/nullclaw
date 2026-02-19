@@ -9,7 +9,8 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
-const Config = @import("config.zig").Config;
+const config_mod = @import("config.zig");
+const Config = config_mod.Config;
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 
@@ -424,8 +425,20 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     };
 
     // Apply overrides
-    if (api_key) |key| cfg.api_key = key;
     if (provider) |p| cfg.default_provider = p;
+    if (api_key) |key| {
+        // Free old providers if previously loaded from config
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.api_base) |b| allocator.free(b);
+        }
+        if (cfg.providers.len > 0) allocator.free(cfg.providers);
+        // Store in providers section for the default provider
+        const entries = try allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try allocator.dupe(u8, cfg.default_provider), .api_key = key };
+        cfg.providers = entries;
+    }
     if (memory_backend) |mb| cfg.memory.backend = mb;
 
     // Set default model based on provider
@@ -457,10 +470,10 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     if (cfg.default_model) |m| {
         try stdout.print("  [OK] Model:      {s}\n", .{m});
     }
-    try stdout.print("  [OK] API Key:    {s}\n", .{if (cfg.api_key != null) "set" else "not set (use --api-key or edit config)"});
+    try stdout.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "not set (use --api-key or edit config)"});
     try stdout.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try stdout.writeAll("\n  Next steps:\n");
-    if (cfg.api_key == null) {
+    if (cfg.defaultProviderKey() == null) {
         try stdout.writeAll("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"\n");
         try stdout.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
         try stdout.writeAll("    3. Gateway:           nullclaw gateway\n");
@@ -582,7 +595,16 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         return;
     };
     if (api_key_input.len > 0) {
-        cfg.api_key = try allocator.dupe(u8, api_key_input);
+        // Free old providers if previously loaded from config
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.api_base) |b| allocator.free(b);
+        }
+        if (cfg.providers.len > 0) allocator.free(cfg.providers);
+        const entries = try allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try allocator.dupe(u8, cfg.default_provider), .api_key = try allocator.dupe(u8, api_key_input) };
+        cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
         try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
@@ -593,7 +615,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.writeAll("  Fetching available models...\n");
     try out.flush();
 
-    const live_models = fetchModels(allocator, selected_provider.key, cfg.api_key) catch
+    const live_models = fetchModels(allocator, selected_provider.key, cfg.defaultProviderKey()) catch
         try dupeFallbackModels(allocator, selected_provider.key);
     defer {
         for (live_models) |m| allocator.free(m);
@@ -730,13 +752,13 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     if (cfg.default_model) |m| {
         try out.print("  [OK] Model:      {s}\n", .{m});
     }
-    try out.print("  [OK] API Key:    {s}\n", .{if (cfg.api_key != null) "set" else "from environment"});
+    try out.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "from environment"});
     try out.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try out.print("  [OK] Tunnel:     {s}\n", .{cfg.tunnel.provider});
     try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
-    if (cfg.api_key == null) {
+    if (cfg.defaultProviderKey() == null) {
         try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
         try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
         try out.writeAll("    3. Gateway:           nullclaw gateway\n");

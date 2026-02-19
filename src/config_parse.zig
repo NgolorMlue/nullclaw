@@ -33,15 +33,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("default_model")) |v| {
         if (v == .string) self.default_model = try self.allocator.dupe(u8, v.string);
     }
-    if (root.get("api_key")) |v| {
-        if (v == .string) self.api_key = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("api_url")) |v| {
-        if (v == .string) self.api_url = try self.allocator.dupe(u8, v.string);
-    }
-    if (root.get("groq_api_key")) |v| {
-        if (v == .string) self.groq_api_key = try self.allocator.dupe(u8, v.string);
-    }
     if (root.get("default_temperature")) |v| {
         if (v == .float) self.default_temperature = v.float;
         if (v == .integer) self.default_temperature = @floatFromInt(v.integer);
@@ -660,6 +651,77 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Providers (object-of-objects: {"openrouter": {"api_key": "..."}, ...})
+    if (root.get("providers")) |prov| {
+        if (prov == .object) {
+            var prov_list: std.ArrayListUnmanaged(types.ProviderEntry) = .empty;
+            var prov_it = prov.object.iterator();
+            while (prov_it.next()) |entry| {
+                const prov_name = entry.key_ptr.*;
+                const val = entry.value_ptr.*;
+                if (val != .object) continue;
+                var pe = types.ProviderEntry{
+                    .name = try self.allocator.dupe(u8, prov_name),
+                };
+                if (val.object.get("api_key")) |ak| {
+                    if (ak == .string) pe.api_key = try self.allocator.dupe(u8, ak.string);
+                }
+                if (val.object.get("api_base")) |ab| {
+                    if (ab == .string) pe.api_base = try self.allocator.dupe(u8, ab.string);
+                }
+                try prov_list.append(self.allocator, pe);
+            }
+            self.providers = try prov_list.toOwnedSlice(self.allocator);
+        }
+    }
+
+    // Transcription
+    if (root.get("transcription")) |tr| {
+        if (tr == .object) {
+            if (tr.object.get("provider")) |v| {
+                if (v == .string) self.transcription.provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (tr.object.get("model")) |v| {
+                if (v == .string) self.transcription.model = try self.allocator.dupe(u8, v.string);
+            }
+            if (tr.object.get("endpoint")) |v| {
+                if (v == .string) self.transcription.endpoint = try self.allocator.dupe(u8, v.string);
+            }
+            if (tr.object.get("language")) |v| {
+                if (v == .string) self.transcription.language = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
+    // ── Legacy auto-migration ────────────────────────────────────
+    // Top-level "api_key" → providers.{default_provider}.api_key
+    if (root.get("api_key")) |v| {
+        if (v == .string and v.string.len > 0) {
+            if (self.getProviderKey(self.default_provider) == null) {
+                std.log.warn("DEPRECATED: top-level 'api_key' found. Please move to 'providers.<provider>.api_key'", .{});
+                try appendProviderField(self, self.default_provider, try self.allocator.dupe(u8, v.string), null);
+            }
+        }
+    }
+    // Top-level "api_url" → providers.{default_provider}.api_base
+    if (root.get("api_url")) |v| {
+        if (v == .string and v.string.len > 0) {
+            if (self.getProviderBase(self.default_provider) == null) {
+                std.log.warn("DEPRECATED: top-level 'api_url' found. Please move to 'providers.<provider>.api_base'", .{});
+                try appendProviderField(self, self.default_provider, null, try self.allocator.dupe(u8, v.string));
+            }
+        }
+    }
+    // Top-level "groq_api_key" → providers.groq.api_key
+    if (root.get("groq_api_key")) |v| {
+        if (v == .string and v.string.len > 0) {
+            if (self.getProviderKey("groq") == null) {
+                std.log.warn("DEPRECATED: top-level 'groq_api_key' found. Please move to 'providers.<provider>.api_key'", .{});
+                try appendProviderField(self, "groq", try self.allocator.dupe(u8, v.string), null);
+            }
+        }
+    }
+
     // Channels
     if (root.get("channels")) |ch| {
         if (ch == .object) {
@@ -688,4 +750,39 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
         }
     }
+}
+
+/// Helper: append or merge a ProviderEntry for the given provider name.
+/// If a provider with that name already exists, merge missing fields; otherwise create a new entry.
+fn appendProviderField(self: *Config, name: []const u8, api_key: ?[]const u8, api_base: ?[]const u8) !void {
+    const old = self.providers;
+    var list: std.ArrayListUnmanaged(types.ProviderEntry) = .empty;
+    try list.ensureTotalCapacity(self.allocator, @intCast(old.len + 1));
+
+    var found = false;
+    for (old) |e| {
+        if (std.mem.eql(u8, e.name, name)) {
+            found = true;
+            // Merge: keep existing values, fill in missing ones
+            try list.append(self.allocator, .{
+                .name = e.name,
+                .api_key = e.api_key orelse api_key,
+                .api_base = e.api_base orelse api_base,
+            });
+        } else {
+            try list.append(self.allocator, e);
+        }
+    }
+
+    if (!found) {
+        try list.append(self.allocator, .{
+            .name = try self.allocator.dupe(u8, name),
+            .api_key = api_key,
+            .api_base = api_base,
+        });
+    }
+
+    self.providers = try list.toOwnedSlice(self.allocator);
+    // Free old slice (not the elements — they're reused)
+    if (old.len > 0) self.allocator.free(old);
 }

@@ -28,6 +28,23 @@ pub const SandboxBackend = enum {
     none,
 };
 
+// ── Provider entry (for "providers" config section) ─────────────
+
+pub const ProviderEntry = struct {
+    name: []const u8,
+    api_key: ?[]const u8 = null,
+    api_base: ?[]const u8 = null,
+};
+
+// ── Transcription config ────────────────────────────────────────
+
+pub const TranscriptionConfig = struct {
+    provider: []const u8 = "groq",
+    model: []const u8 = "whisper-large-v3",
+    endpoint: ?[]const u8 = null,
+    language: ?[]const u8 = null,
+};
+
 // ── Sub-config structs ──────────────────────────────────────────
 
 pub const ObservabilityConfig = struct {

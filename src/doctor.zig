@@ -138,10 +138,10 @@ pub fn checkConfigSemantics(
     }
 
     // API key
-    if (config.api_key) |_| {
+    if (config.defaultProviderKey()) |_| {
         try items.append(allocator, DiagItem.ok(cat, "API key configured"));
     } else {
-        try items.append(allocator, DiagItem.warn(cat, "no api_key set (may rely on env vars or provider defaults)"));
+        try items.append(allocator, DiagItem.warn(cat, "no API key in providers config (may rely on env vars)"));
     }
 
     // Default model

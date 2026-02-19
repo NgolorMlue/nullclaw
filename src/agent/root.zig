@@ -1096,7 +1096,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .browser_enabled = cfg.browser.enabled,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
-        .fallback_api_key = cfg.api_key,
+        .fallback_api_key = cfg.defaultProviderKey(),
         .tools_config = cfg.tools,
     });
     defer allocator.free(tools);
@@ -1125,16 +1125,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var holder: ProviderHolder = switch (kind) {
         .anthropic_provider => .{ .anthropic = providers.anthropic.AnthropicProvider.init(
             allocator,
-            cfg.api_key,
+            cfg.defaultProviderKey(),
             if (std.mem.startsWith(u8, cfg.default_provider, "anthropic-custom:"))
                 cfg.default_provider["anthropic-custom:".len..]
             else
                 null,
         ) },
-        .openai_provider => .{ .openai = providers.openai.OpenAiProvider.init(allocator, cfg.api_key) },
-        .gemini_provider => .{ .gemini = providers.gemini.GeminiProvider.init(allocator, cfg.api_key) },
+        .openai_provider => .{ .openai = providers.openai.OpenAiProvider.init(allocator, cfg.defaultProviderKey()) },
+        .gemini_provider => .{ .gemini = providers.gemini.GeminiProvider.init(allocator, cfg.defaultProviderKey()) },
         .ollama_provider => .{ .ollama = providers.ollama.OllamaProvider.init(allocator, null) },
-        .openrouter_provider => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
+        .openrouter_provider => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.defaultProviderKey()) },
         .compatible_provider => .{ .compatible = providers.compatible.OpenAiCompatibleProvider.init(
             allocator,
             cfg.default_provider,
@@ -1142,18 +1142,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 cfg.default_provider["custom:".len..]
             else
                 providers.compatibleProviderUrl(cfg.default_provider) orelse "https://openrouter.ai/api/v1",
-            cfg.api_key,
+            cfg.defaultProviderKey(),
             .bearer,
         ) },
         .claude_cli_provider => if (providers.claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
             .{ .claude_cli = p }
         else |_|
-            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
+            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.defaultProviderKey()) },
         .codex_cli_provider => if (providers.codex_cli.CodexCliProvider.init(allocator, null)) |p|
             .{ .codex_cli = p }
         else |_|
-            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
-        .unknown => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.api_key) },
+            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.defaultProviderKey()) },
+        .unknown => .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, cfg.defaultProviderKey()) },
     };
 
     const provider_i: Provider = switch (holder) {

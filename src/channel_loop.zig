@@ -13,6 +13,7 @@ const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
 const mcp = @import("mcp.zig");
+const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 
@@ -78,17 +79,18 @@ pub const ChannelRuntime = struct {
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
+        const api_key = config.defaultProviderKey();
         holder.* = if (std.mem.eql(u8, config.default_provider, "anthropic"))
-            .{ .anthropic = providers.anthropic.AnthropicProvider.init(allocator, config.api_key, null) }
+            .{ .anthropic = providers.anthropic.AnthropicProvider.init(allocator, api_key, null) }
         else if (std.mem.eql(u8, config.default_provider, "openai"))
-            .{ .openai = providers.openai.OpenAiProvider.init(allocator, config.api_key) }
+            .{ .openai = providers.openai.OpenAiProvider.init(allocator, api_key) }
         else if (std.mem.eql(u8, config.default_provider, "gemini") or
             std.mem.eql(u8, config.default_provider, "google"))
-            .{ .gemini = providers.gemini.GeminiProvider.init(allocator, config.api_key) }
+            .{ .gemini = providers.gemini.GeminiProvider.init(allocator, api_key) }
         else if (std.mem.eql(u8, config.default_provider, "ollama"))
             .{ .ollama = providers.ollama.OllamaProvider.init(allocator, null) }
         else
-            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, config.api_key) };
+            .{ .openrouter = providers.openrouter.OpenRouterProvider.init(allocator, api_key) };
 
         const provider_i = holder.provider();
 
@@ -108,7 +110,7 @@ pub const ChannelRuntime = struct {
             .screenshot_enabled = true,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
-            .fallback_api_key = config.api_key,
+            .fallback_api_key = config.defaultProviderKey(),
             .tools_config = config.tools,
         }) catch &.{};
         errdefer if (tools.len > 0) allocator.free(tools);
@@ -173,8 +175,24 @@ pub fn runTelegramLoop(
     // Heap-alloc TelegramChannel for vtable pointer stability
     const tg_ptr = allocator.create(telegram.TelegramChannel) catch return;
     defer allocator.destroy(tg_ptr);
-    tg_ptr.* = telegram.TelegramChannel.init(allocator, telegram_config.bot_token, telegram_config.allowed_users, config.groq_api_key);
+    tg_ptr.* = telegram.TelegramChannel.init(allocator, telegram_config.bot_token, telegram_config.allowed_users);
     tg_ptr.proxy = telegram_config.proxy;
+
+    // Set up transcription — key comes from providers.{transcription.provider}
+    const trans = config.transcription;
+    if (config.getProviderKey(trans.provider)) |key| {
+        const wt = allocator.create(voice.WhisperTranscriber) catch {
+            log.warn("Failed to allocate WhisperTranscriber", .{});
+            return;
+        };
+        wt.* = .{
+            .endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.endpoint),
+            .api_key = key,
+            .model = trans.model,
+            .language = trans.language,
+        };
+        tg_ptr.transcriber = wt.transcriber();
+    }
 
     // Register bot commands and skip stale messages
     tg_ptr.setMyCommands();

@@ -675,8 +675,9 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     else
         telegram_config.allowed_users;
 
-    if (config.api_key == null) {
-        std.debug.print("No API key in config. Add api_key to ~/.nullclaw/config.json\n", .{});
+    if (config.defaultProviderKey() == null) {
+        std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
     }
 
@@ -699,8 +700,22 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         std.debug.print("\n", .{});
     }
 
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, config.groq_api_key);
+    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
     tg.proxy = telegram_config.proxy;
+
+    // Set up transcription — key comes from providers.{transcription.provider}
+    const trans = config.transcription;
+    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
+        const wt = try allocator.create(yc.voice.WhisperTranscriber);
+        wt.* = .{
+            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.endpoint),
+            .api_key = key,
+            .model = trans.model,
+            .language = trans.language,
+        };
+        break :blk wt;
+    } else null;
+    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
 
     // Initialize MCP tools from config
     const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
@@ -718,7 +733,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
-        .fallback_api_key = config.api_key,
+        .fallback_api_key = config.defaultProviderKey(),
         .tools_config = config.tools,
     }) catch &.{};
     defer if (tools.len > 0) allocator.free(tools);
@@ -751,18 +766,19 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         ollama: yc.providers.ollama.OllamaProvider,
     };
 
+    const api_key = config.defaultProviderKey();
     var holder: ProviderHolder = if (std.mem.eql(u8, config.default_provider, "anthropic"))
-        .{ .anthropic = yc.providers.anthropic.AnthropicProvider.init(allocator, config.api_key, null) }
+        .{ .anthropic = yc.providers.anthropic.AnthropicProvider.init(allocator, api_key, null) }
     else if (std.mem.eql(u8, config.default_provider, "openai"))
-        .{ .openai = yc.providers.openai.OpenAiProvider.init(allocator, config.api_key) }
+        .{ .openai = yc.providers.openai.OpenAiProvider.init(allocator, api_key) }
     else if (std.mem.eql(u8, config.default_provider, "gemini") or
         std.mem.eql(u8, config.default_provider, "google"))
-        .{ .gemini = yc.providers.gemini.GeminiProvider.init(allocator, config.api_key) }
+        .{ .gemini = yc.providers.gemini.GeminiProvider.init(allocator, api_key) }
     else if (std.mem.eql(u8, config.default_provider, "ollama"))
         .{ .ollama = yc.providers.ollama.OllamaProvider.init(allocator, null) }
     else
         // Default: OpenRouter (also handles all other provider names)
-        .{ .openrouter = yc.providers.openrouter.OpenRouterProvider.init(allocator, config.api_key) };
+        .{ .openrouter = yc.providers.openrouter.OpenRouterProvider.init(allocator, api_key) };
 
     const provider_i: yc.providers.Provider = switch (holder) {
         .openrouter => |*p| p.provider(),

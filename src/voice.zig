@@ -28,6 +28,56 @@ pub const TranscribeError = error{
     InvalidResponse,
 } || std.mem.Allocator.Error;
 
+// ════════════════════════════════════════════════════════════════════════════
+// Transcriber vtable interface
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const Transcriber = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        transcribe: *const fn (*anyopaque, std.mem.Allocator, []const u8) TranscribeError!?[]const u8,
+    };
+
+    pub fn transcribe(self: Transcriber, alloc: std.mem.Allocator, path: []const u8) TranscribeError!?[]const u8 {
+        return self.vtable.transcribe(self.ptr, alloc, path);
+    }
+};
+
+pub const WhisperTranscriber = struct {
+    endpoint: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    language: ?[]const u8,
+
+    fn vtableTranscribe(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) TranscribeError!?[]const u8 {
+        const self: *WhisperTranscriber = @ptrCast(@alignCast(ptr));
+        const result = try transcribeFile(alloc, self.api_key, self.endpoint, path, .{
+            .model = self.model,
+            .language = self.language,
+        });
+        return result;
+    }
+
+    pub const vtable = Transcriber.VTable{
+        .transcribe = &vtableTranscribe,
+    };
+
+    pub fn transcriber(self: *WhisperTranscriber) Transcriber {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+/// Resolve transcription endpoint for a given provider name.
+pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
+    if (explicit_endpoint) |ep| return ep;
+    if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
+    if (std.mem.eql(u8, provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+    // For unknown providers, try OpenAI-compatible endpoint
+    return "https://api.groq.com/openai/v1/audio/transcriptions";
+}
+
 /// Transcribe an audio file using the Groq Whisper API.
 ///
 /// Reads the file at `file_path`, builds a multipart/form-data request,
@@ -36,6 +86,7 @@ pub const TranscribeError = error{
 pub fn transcribeFile(
     allocator: std.mem.Allocator,
     api_key: []const u8,
+    endpoint: []const u8,
     file_path: []const u8,
     opts: TranscribeOptions,
 ) TranscribeError![]const u8 {
@@ -72,7 +123,7 @@ pub fn transcribeFile(
     // POST via curl using --data-binary @tempfile
     const resp = curlPostFromFile(
         allocator,
-        "https://api.groq.com/openai/v1/audio/transcriptions",
+        endpoint,
         tmp_path,
         &.{ auth_hdr, content_type_hdr },
     ) catch return error.ApiRequestFailed;
@@ -269,18 +320,14 @@ fn curlPostFromFile(
 
 /// Download a Telegram voice/audio file and transcribe it.
 /// Returns the transcribed text, or null if transcription is unavailable
-/// (no Groq API key configured or file download fails).
-/// Resolves the API key with config-first, env-var-fallback:
-///   1. `groq_api_key` from config (passed explicitly)
-///   2. `GROQ_API_KEY` environment variable
+/// (no Transcriber configured or file download fails).
 pub fn transcribeTelegramVoice(
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     file_id: []const u8,
-    groq_api_key: ?[]const u8,
+    t: ?Transcriber,
 ) ?[]const u8 {
-    // Resolve Groq API key: config value first, then env var fallback
-    const api_key = groq_api_key orelse std.posix.getenv("GROQ_API_KEY") orelse return null;
+    const transcr = t orelse return null;
 
     // 1. Call getFile to get file_path
     const tg_file_path = getFilePath(allocator, bot_token, file_id) catch |err| {
@@ -300,8 +347,8 @@ pub fn transcribeTelegramVoice(
         allocator.free(local_path);
     }
 
-    // 3. Transcribe
-    const text = transcribeFile(allocator, api_key, local_path, .{}) catch |err| {
+    // 3. Transcribe via vtable
+    const text = transcr.transcribe(allocator, local_path) catch |err| {
         log.err("transcription failed: {}", .{err});
         return null;
     };
@@ -488,12 +535,55 @@ test "voice parseTranscriptionText empty text" {
 
 test "voice transcribeFile returns error for nonexistent file" {
     const allocator = std.testing.allocator;
-    const result = transcribeFile(allocator, "fake_key", "/nonexistent/path/audio.ogg", .{});
+    const result = transcribeFile(allocator, "fake_key", "https://api.groq.com/openai/v1/audio/transcriptions", "/nonexistent/path/audio.ogg", .{});
     try std.testing.expectError(error.FileReadFailed, result);
 }
 
-test "voice transcribeTelegramVoice returns null without GROQ_API_KEY" {
-    // Neither config key nor GROQ_API_KEY env var set in test env, so should return null
+test "voice transcribeTelegramVoice returns null without transcriber" {
+    // No transcriber configured, so should return null
     const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null);
     try std.testing.expect(result == null);
+}
+
+test "voice WhisperTranscriber stores fields" {
+    var wt = WhisperTranscriber{
+        .endpoint = "https://api.groq.com/openai/v1/audio/transcriptions",
+        .api_key = "gsk_test",
+        .model = "whisper-large-v3",
+        .language = "ru",
+    };
+    try std.testing.expectEqualStrings("gsk_test", wt.api_key);
+    try std.testing.expectEqualStrings("ru", wt.language.?);
+    // Vtable dispatches
+    const t = wt.transcriber();
+    try std.testing.expect(t.vtable == &WhisperTranscriber.vtable);
+}
+
+test "voice resolveTranscriptionEndpoint groq" {
+    try std.testing.expectEqualStrings(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        resolveTranscriptionEndpoint("groq", null),
+    );
+}
+
+test "voice resolveTranscriptionEndpoint openai" {
+    try std.testing.expectEqualStrings(
+        "https://api.openai.com/v1/audio/transcriptions",
+        resolveTranscriptionEndpoint("openai", null),
+    );
+}
+
+test "voice resolveTranscriptionEndpoint explicit" {
+    try std.testing.expectEqualStrings(
+        "http://localhost:9090/v1/transcribe",
+        resolveTranscriptionEndpoint("groq", "http://localhost:9090/v1/transcribe"),
+    );
+}
+
+test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
+    // Unknown providers fall back to the Groq-compatible endpoint
+    try std.testing.expectEqualStrings(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        resolveTranscriptionEndpoint("some-unknown-provider", null),
+    );
 }

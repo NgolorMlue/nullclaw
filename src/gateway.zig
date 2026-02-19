@@ -620,7 +620,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
 
     if (config_opt) |*cfg| {
         // Build provider holder from configured provider name.
-        const api_key = cfg.api_key orelse "";
+        const api_key = cfg.defaultProviderKey() orelse "";
         holder_opt = if (std.mem.eql(u8, cfg.default_provider, "anthropic"))
             .{ .anthropic = providers.anthropic.AnthropicProvider.init(allocator, api_key, null) }
         else if (std.mem.eql(u8, cfg.default_provider, "openai"))
@@ -658,7 +658,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 .browser_enabled = cfg.browser.enabled,
                 .screenshot_enabled = true,
                 .agents = cfg.agents,
-                .fallback_api_key = cfg.api_key,
+                .fallback_api_key = cfg.defaultProviderKey(),
             }) catch &.{};
 
             // Noop observer.
