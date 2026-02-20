@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("platform.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
 
@@ -159,10 +160,7 @@ pub const Config = struct {
         }
         const allocator = arena_ptr.allocator();
 
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.NoHomeDir,
-            else => return err,
-        };
+        const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
 
         const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });

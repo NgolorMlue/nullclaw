@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const platform = @import("../platform.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -59,8 +60,9 @@ pub const WebSearchTool = struct {
         const count = parseCount(args);
 
         // Get API key from environment
-        const api_key = std.posix.getenv("BRAVE_API_KEY") orelse
+        const api_key = platform.getEnvOrNull(allocator, "BRAVE_API_KEY") orelse
             return ToolResult.fail("BRAVE_API_KEY environment variable not set. Get a free key at https://brave.com/search/api/");
+        defer allocator.free(api_key);
 
         if (api_key.len == 0)
             return ToolResult.fail("BRAVE_API_KEY is empty");
@@ -254,7 +256,10 @@ test "WebSearchTool empty query fails" {
 test "WebSearchTool no API key fails with helpful message" {
     // This test relies on BRAVE_API_KEY not being set in test env
     // If it is set, the test would try to make a real request
-    if (std.posix.getenv("BRAVE_API_KEY")) |_| return;
+    if (platform.getEnvOrNull(testing.allocator, "BRAVE_API_KEY")) |k| {
+        testing.allocator.free(k);
+        return;
+    }
     var wst = WebSearchTool{};
     const parsed = try root.parseTestArgs("{\"query\":\"zig programming\"}");
     defer parsed.deinit();

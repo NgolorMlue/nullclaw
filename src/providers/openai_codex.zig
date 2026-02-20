@@ -7,6 +7,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
+const platform = @import("../platform.zig");
 const auth = @import("../auth.zig");
 
 const Provider = root.Provider;
@@ -604,8 +605,9 @@ pub fn extractAccountIdFromJwt(allocator: std.mem.Allocator, token: []const u8) 
 /// Returns an OAuthToken with access_token, refresh_token, and decoded JWT exp.
 /// Returns null on any error (file not found, parse failure, etc.).
 pub fn tryLoadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
-    const home = std.posix.getenv("HOME") orelse return null;
-    const path = std.fmt.allocPrint(allocator, "{s}/.codex/auth.json", .{home}) catch return null;
+    const home = platform.getHomeDir(allocator) catch return null;
+    defer allocator.free(home);
+    const path = std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }) catch return null;
     defer allocator.free(path);
 
     const file = std.fs.cwd().openFile(path, .{}) catch return null;

@@ -6,6 +6,7 @@
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
+const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 
 // ── PKCE (RFC 7636) ────────────────────────────────────────────────────
@@ -86,15 +87,16 @@ const CRED_FILE = "auth.json";
 /// Merges with existing credentials (other providers are preserved).
 /// File permissions are set to 0o600.
 pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token: OAuthToken) !void {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = platform.getHomeDir(allocator) catch return error.HomeNotSet;
+    defer allocator.free(home);
 
-    const dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, CRED_DIR });
+    const dir_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR });
     defer allocator.free(dir_path);
 
     // Ensure directory exists
     std.fs.cwd().makePath(dir_path) catch return error.CredentialWriteFailed;
 
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, CRED_FILE });
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, CRED_FILE });
     defer allocator.free(file_path);
 
     // Read existing credentials (if any)
@@ -159,9 +161,10 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
 /// Load a credential for the given provider from ~/.nullclaw/auth.json.
 /// Returns null if the file is missing, the provider is not found, or the token is expired.
 pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAuthToken {
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = platform.getHomeDir(allocator) catch return null;
+    defer allocator.free(home);
 
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ home, CRED_DIR, CRED_FILE });
+    const file_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR, CRED_FILE });
     defer allocator.free(file_path);
 
     const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
@@ -358,9 +361,10 @@ pub fn refreshAccessToken(
 /// Delete a credential for the given provider from ~/.nullclaw/auth.json.
 /// Returns true if the credential was found and removed.
 pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !bool {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = platform.getHomeDir(allocator) catch return error.HomeNotSet;
+    defer allocator.free(home);
 
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ home, CRED_DIR, CRED_FILE });
+    const file_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR, CRED_FILE });
     defer allocator.free(file_path);
 
     var existing = loadAllCredentials(allocator, file_path) orelse return false;

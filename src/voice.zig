@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("platform.zig");
 const root = @import("root.zig");
 
 const log = std.log.scoped(.voice);
@@ -93,10 +94,12 @@ pub fn transcribeFile(
     // Generate random boundary (16 hex chars)
     const boundary = generateBoundary() catch return error.BoundaryGenerationFailed;
 
-    // Build temp file path
+    // Build temp file path (platform-aware temp dir)
+    const tmp_dir = platform.getTempDir(allocator) catch return error.FileReadFailed;
+    defer allocator.free(tmp_dir);
     var tmp_path_buf: [256]u8 = undefined;
     var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
-    tmp_fbs.writer().print("/tmp/nullclaw_voice_{d}.bin", .{getPid()}) catch
+    tmp_fbs.writer().print("{s}/nullclaw_voice_{d}.bin", .{ tmp_dir, getPid() }) catch
         return error.FileReadFailed;
     const tmp_path_len = tmp_fbs.pos;
     tmp_path_buf[tmp_path_len] = 0;
@@ -384,7 +387,7 @@ fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []c
     return try allocator.dupe(u8, fp_val.string);
 }
 
-/// Download a file from Telegram and save to /tmp. Returns the local path (owned).
+/// Download a file from Telegram and save to temp dir. Returns the local path (owned).
 fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_file_path: []const u8) ![]u8 {
     var url_buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&url_buf);
@@ -394,11 +397,13 @@ fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_
     const data = try root.http_util.curlGet(allocator, url, &.{}, "30");
     defer allocator.free(data);
 
-    // Save to temp file
+    // Save to temp file (platform-aware temp dir)
+    const tmp_dir = platform.getTempDir(allocator) catch return error.OutOfMemory;
+    defer allocator.free(tmp_dir);
     const pid = getPid();
     var path_buf: [256]u8 = undefined;
     var path_fbs = std.io.fixedBufferStream(&path_buf);
-    try path_fbs.writer().print("/tmp/nullclaw_tg_voice_{d}.ogg", .{pid});
+    try path_fbs.writer().print("{s}/nullclaw_tg_voice_{d}.ogg", .{ tmp_dir, pid });
     const local_path = path_fbs.getWritten();
 
     var z_buf: [256]u8 = undefined;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("platform.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -266,7 +267,8 @@ pub fn checkRequirements(allocator: std.mem.Allocator, skill: *Skill) void {
 
     // Check required environment variables
     for (skill.requires_env) |env_name| {
-        const val = std.posix.getenv(env_name);
+        const val = platform.getEnvOrNull(allocator, env_name);
+        defer if (val) |v| allocator.free(v);
         if (val == null) {
             if (missing.items.len > 0) missing.append(allocator, ',') catch {};
             missing.append(allocator, ' ') catch {};
@@ -546,14 +548,15 @@ fn writeSyncMarker(allocator: std.mem.Allocator, marker_path: []const u8) !void 
 /// Gracefully returns without error if git is unavailable or sync is disabled.
 pub fn syncCommunitySkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !void {
     // Check if enabled via env var
-    const enabled_env = std.posix.getenv("NULLCLAW_OPEN_SKILLS_ENABLED");
+    const enabled_env = platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_ENABLED");
+    defer if (enabled_env) |v| allocator.free(v);
     if (enabled_env == null) return; // not set — disabled
     if (std.mem.eql(u8, enabled_env.?, "false")) return;
 
     // Determine community skills directory
     const community_dir = blk: {
-        if (std.posix.getenv("NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
-            break :blk try allocator.dupe(u8, dir);
+        if (platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
+            break :blk dir;
         }
         break :blk try std.fmt.allocPrint(allocator, "{s}/skills/community", .{workspace_dir});
     };
@@ -709,7 +712,8 @@ fn countMdFiles(dir_path: []const u8) u32 {
 /// This wraps syncCommunitySkills with additional information about the outcome.
 pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []const u8) !SyncResult {
     // Check if enabled via env var
-    const enabled_env = std.posix.getenv("NULLCLAW_OPEN_SKILLS_ENABLED");
+    const enabled_env = platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_ENABLED");
+    defer if (enabled_env) |v| allocator.free(v);
     if (enabled_env == null) {
         return SyncResult{
             .synced = false,
@@ -727,8 +731,8 @@ pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []
 
     // Determine community skills directory
     const community_dir = blk: {
-        if (std.posix.getenv("NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
-            break :blk try allocator.dupe(u8, dir);
+        if (platform.getEnvOrNull(allocator, "NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
+            break :blk dir;
         }
         break :blk try std.fmt.allocPrint(allocator, "{s}/skills/community", .{workspace_dir});
     };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const RateTracker = @import("tracker.zig").RateTracker;
 
 /// How much autonomy the agent has
@@ -421,10 +422,11 @@ fn hasParentDirComponent(path: []const u8) bool {
     return false;
 }
 
-/// Expand ~ to HOME env var
+/// Expand ~ to home directory
 fn expandTilde(path: []const u8, buf: []u8) []const u8 {
     if (path.len >= 2 and path[0] == '~' and path[1] == '/') {
-        if (std.posix.getenv("HOME")) |home| {
+        if (platform.getEnvOrNull(std.heap.page_allocator, if (@import("builtin").os.tag == .windows) "USERPROFILE" else "HOME")) |home| {
+            defer std.heap.page_allocator.free(home);
             const rest = path[1..]; // includes the '/'
             const total = home.len + rest.len;
             if (total <= buf.len) {

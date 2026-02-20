@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 
 const log = std.log.scoped(.cron);
@@ -437,7 +438,7 @@ pub const CronScheduler = struct {
                     // Execute shell command via child process
                     const result = std.process.Child.run(.{
                         .allocator = self.allocator,
-                        .argv = &.{ "sh", "-c", job.command },
+                        .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
                     }) catch |err| {
                         log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
                         job.last_status = "error";
@@ -576,16 +577,16 @@ const JsonCronJob = struct {
 
 /// Get the default cron.json path: ~/.nullclaw/cron.json
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.nullclaw/cron.json", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
 }
 
 /// Ensure the ~/.nullclaw directory exists.
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw", .{home});
+    const dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
     defer allocator.free(dir);
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -820,7 +821,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         log.info("Running job '{s}': {s}", .{ id, job.command });
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{ "sh", "-c", job.command },
+            .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
         }) catch |err| {
             log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
             return;

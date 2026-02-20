@@ -9,6 +9,7 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const memory_root = @import("memory/root.zig");
@@ -169,11 +170,11 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
 pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch
+    const home = platform.getHomeDir(allocator) catch
         return dupeFallbackModels(allocator, provider);
     defer allocator.free(home);
 
-    const state_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/state", .{home});
+    const state_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "state" });
     defer allocator.free(state_dir);
 
     // Ensure state directory exists
@@ -797,15 +798,15 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     try out.flush();
 
     // Build cache path
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+    const home = platform.getHomeDir(allocator) catch {
         try out.writeAll("Could not determine HOME directory.\n");
         try out.flush();
         return;
     };
     defer allocator.free(home);
-    const cache_path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/models_cache.json", .{home});
+    const cache_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "models_cache.json" });
     defer allocator.free(cache_path);
-    const cache_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw", .{home});
+    const cache_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
     defer allocator.free(cache_dir);
 
     // Ensure directory exists
@@ -1138,15 +1139,15 @@ pub fn defaultBackendKey() []const u8 {
 // ── Path helpers ─────────────────────────────────────────────────
 
 fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.nullclaw/workspace", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "workspace" });
 }
 
 fn getDefaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.nullclaw/config.json", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
 }
 
 // ── Tests ────────────────────────────────────────────────────────

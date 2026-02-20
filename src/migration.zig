@@ -8,6 +8,7 @@
 //!   - Creates backup before import
 
 const std = @import("std");
+const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const memory_root = @import("memory/root.zig");
 
@@ -223,9 +224,9 @@ fn parseStructuredLine(line: []const u8) struct { key: ?[]const u8, value: ?[]co
 /// Resolve the OpenClaw workspace directory.
 fn resolveOpenclawWorkspace(allocator: std.mem.Allocator, source: ?[]const u8) ![]u8 {
     if (source) |src| return allocator.dupe(u8, src);
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+    const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.openclaw/workspace", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".openclaw", "workspace" });
 }
 
 /// Check if two paths refer to the same location.

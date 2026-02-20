@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
@@ -209,7 +210,9 @@ pub const DiscordChannel = struct {
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd >= 0) {
-            std.posix.close(@intCast(fd)) catch {};
+            if (comptime builtin.os.tag != .windows) {
+                std.posix.close(@intCast(fd)) catch {};
+            }
         }
         if (self.gateway_thread) |t| {
             t.join();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -66,7 +67,7 @@ pub const CronRunTool = struct {
         // Execute the command
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{ "sh", "-c", command },
+            .argv = &.{ platform.getShell(), platform.getShellFlag(), command },
             .max_output_bytes = 65536,
         }) catch |err| {
             // Update last_status to error

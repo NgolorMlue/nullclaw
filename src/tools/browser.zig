@@ -88,15 +88,11 @@ pub const BrowserTool = struct {
             return ToolResult{ .success = true, .output = msg };
         }
 
-        const open_cmd = comptime if (builtin.os.tag == .macos)
-            "open"
-        else if (builtin.os.tag == .linux)
-            "xdg-open"
-        else
-            @compileError("unsupported OS for browser open");
-
         var child = std.process.Child.init(
-            &.{ open_cmd, url },
+            if (comptime builtin.os.tag == .windows)
+                &.{ "cmd.exe", "/c", "start", url }
+            else
+                &.{ comptime if (builtin.os.tag == .macos) "open" else "xdg-open", url },
             allocator,
         );
         child.stdout_behavior = .Pipe;

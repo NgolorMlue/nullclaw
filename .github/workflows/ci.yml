@@ -8,12 +8,21 @@ on:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-aarch64
+          - os: windows-latest
+            target: windows-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -27,8 +36,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .zig-cache
-          key: zig-${{ matrix.os }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
-          restore-keys: zig-${{ matrix.os }}-
+          key: zig-${{ matrix.target }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
+          restore-keys: zig-${{ matrix.target }}-
 
       - name: Run tests
         run: zig build test --summary all 2>&1 | tee test-output.txt
@@ -39,7 +48,7 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          echo "## nullClaw CI — ${{ matrix.os }}" >> $GITHUB_STEP_SUMMARY
+          echo "## nullClaw CI — ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
@@ -51,8 +60,12 @@ jobs:
             echo "| Test MaxRSS | ${RSS:-—} |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ -f zig-out/bin/nullclaw ]; then
-            SIZE=$(wc -c < zig-out/bin/nullclaw | tr -d ' ')
+          BIN="zig-out/bin/nullclaw"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="zig-out/bin/nullclaw.exe"
+          fi
+          if [ -f "$BIN" ]; then
+            SIZE=$(wc -c < "$BIN" | tr -d ' ')
             SIZE_HR=$(awk "BEGIN {printf \"%.1f MB\", $SIZE / 1048576}")
             echo "| Binary (ReleaseSmall) | ${SIZE_HR} (${SIZE} bytes) |" >> $GITHUB_STEP_SUMMARY
           fi
@@ -61,5 +74,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: nullclaw-${{ matrix.os == 'ubuntu-latest' && 'linux-x86_64' || 'macos-aarch64' }}
-          path: zig-out/bin/nullclaw
+          name: nullclaw-${{ matrix.target }}
+          path: zig-out/bin/nullclaw${{ runner.os == 'Windows' && '.exe' || '' }}

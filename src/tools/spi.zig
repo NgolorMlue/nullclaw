@@ -152,7 +152,7 @@ pub const SpiTool = struct {
         bits_per_word: u8,
     ) !ToolResult {
         if (comptime builtin.os.tag != .linux) {
-            unreachable;
+            return ToolResult.fail("SPI is only supported on Linux");
         }
 
         // ioctl constants for SPI

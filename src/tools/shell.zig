@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -82,9 +83,9 @@ pub const ShellTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        // Execute via /bin/sh -c
+        // Execute via platform shell
         var child = std.process.Child.init(
-            &.{ "/bin/sh", "-c", command },
+            &.{ platform.getShell(), platform.getShellFlag(), command },
             allocator,
         );
         child.cwd = effective_cwd;
@@ -96,7 +97,8 @@ pub const ShellTool = struct {
         var env = std.process.EnvMap.init(allocator);
         defer env.deinit();
         for (&SAFE_ENV_VARS) |key| {
-            if (std.posix.getenv(key)) |val| {
+            if (platform.getEnvOrNull(allocator, key)) |val| {
+                defer allocator.free(val);
                 try env.put(key, val);
             }
         }

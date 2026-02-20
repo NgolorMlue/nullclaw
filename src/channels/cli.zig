@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const root = @import("root.zig");
 
 /// CLI channel — reads from stdin, writes to stdout.
@@ -187,9 +188,9 @@ pub fn saveHistory(history: []const []const u8, path: []const u8) !void {
 /// Resolve the default history file path (~/.nullclaw_history).
 /// Caller owns the returned string.
 pub fn defaultHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.nullclaw_history", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw_history" });
 }
 
 // ════════════════════════════════════════════════════════════════════════════

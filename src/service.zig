@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("platform.zig");
 
 const SERVICE_LABEL = "com.nullclaw.daemon";
 
@@ -219,20 +220,20 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
 // ── Path helpers ─────────────────────────────────────────────────
 
-fn getHomeDir(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
+    return platform.getHomeDir(allocator) catch return error.NoHomeDir;
 }
 
-fn macosServiceFile(allocator: std.mem.Allocator) ![]u8 {
+fn macosServiceFile(allocator: std.mem.Allocator) ![]const u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents/{s}.plist", .{ home, SERVICE_LABEL });
+    return std.fs.path.join(allocator, &.{ home, "Library", "LaunchAgents", SERVICE_LABEL ++ ".plist" });
 }
 
-fn linuxServiceFile(allocator: std.mem.Allocator) ![]u8 {
+fn linuxServiceFile(allocator: std.mem.Allocator) ![]const u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.config/systemd/user/nullclaw.service", .{home});
+    return std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullclaw.service" });
 }
 
 // ── Process helpers ──────────────────────────────────────────────

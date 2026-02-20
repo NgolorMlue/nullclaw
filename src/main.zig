@@ -1059,12 +1059,13 @@ fn runAuthImportCodex(
     codex: type,
     auth_mod: type,
 ) void {
-    const home = std.posix.getenv("HOME") orelse {
+    const home = yc.platform.getHomeDir(allocator) catch {
         std.debug.print("HOME not set.\n", .{});
         std.process.exit(1);
     };
+    defer allocator.free(home);
 
-    const path = std.fmt.allocPrint(allocator, "{s}/.codex/auth.json", .{home}) catch {
+    const path = std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" }) catch {
         std.debug.print("Out of memory.\n", .{});
         std.process.exit(1);
     };

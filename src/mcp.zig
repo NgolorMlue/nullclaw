@@ -10,6 +10,7 @@ const tools_mod = @import("tools/root.zig");
 const config_mod = @import("config.zig");
 const yc = @import("root.zig");
 const version = @import("version.zig");
+const platform = @import("platform.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp);
@@ -62,11 +63,16 @@ pub const McpServer = struct {
         var env = std.process.EnvMap.init(self.allocator);
         // Add PATH, HOME, etc. from parent
         const inherit_vars = [_][]const u8{
-            "PATH", "HOME",  "TERM",   "LANG",      "LC_ALL",            "LC_CTYPE",
-            "USER", "SHELL", "TMPDIR", "NODE_PATH", "NPM_CONFIG_PREFIX",
+            "PATH",              "HOME",        "TERM",    "LANG",         "LC_ALL",
+            "LC_CTYPE",          "USER",        "SHELL",   "TMPDIR",       "NODE_PATH",
+            "NPM_CONFIG_PREFIX",
+            // Windows-specific
+            "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP",
+            "TMP",               "SYSTEMROOT",  "COMSPEC", "PROGRAMFILES", "WINDIR",
         };
         for (&inherit_vars) |key| {
-            if (std.posix.getenv(key)) |val| {
+            if (platform.getEnvOrNull(self.allocator, key)) |val| {
+                defer self.allocator.free(val);
                 try env.put(key, val);
             }
         }

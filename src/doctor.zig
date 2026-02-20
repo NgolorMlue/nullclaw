@@ -9,6 +9,7 @@
 //!   - Sandbox, cron status, channel connectivity (nullclaw-specific)
 
 const std = @import("std");
+const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
@@ -510,11 +511,11 @@ pub fn checkEnvironment(
     }
 
     // $HOME
-    if (std.process.getEnvVarOwned(allocator, "HOME")) |home| {
+    if (platform.getHomeDir(allocator)) |home| {
         defer allocator.free(home);
         try items.append(allocator, DiagItem.ok(cat, "home directory env set"));
     } else |_| {
-        try items.append(allocator, DiagItem.err(cat, "$HOME is not set"));
+        try items.append(allocator, DiagItem.err(cat, "home directory is not set"));
     }
 }
 

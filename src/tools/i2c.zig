@@ -124,6 +124,7 @@ pub const I2cTool = struct {
     // ── Linux implementations ───────────────────────────────────────
 
     fn detectLinux(allocator: std.mem.Allocator) !ToolResult {
+        if (comptime builtin.os.tag != .linux) return ToolResult.fail("I2C is only supported on Linux");
         var output: std.ArrayList(u8) = .{};
         errdefer output.deinit(allocator);
         try output.appendSlice(allocator, "{\"buses\":[");
@@ -152,6 +153,7 @@ pub const I2cTool = struct {
     }
 
     fn scanLinux(allocator: std.mem.Allocator, bus: u32) !ToolResult {
+        if (comptime builtin.os.tag != .linux) return ToolResult.fail("I2C is only supported on Linux");
         var path_buf: [32]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");
@@ -197,6 +199,7 @@ pub const I2cTool = struct {
     }
 
     fn readLinux(allocator: std.mem.Allocator, bus: u32, addr: u7, register: u8, length: u8) !ToolResult {
+        if (comptime builtin.os.tag != .linux) return ToolResult.fail("I2C is only supported on Linux");
         var path_buf: [32]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");
@@ -251,6 +254,7 @@ pub const I2cTool = struct {
     }
 
     fn writeLinux(allocator: std.mem.Allocator, bus: u32, addr: u7, register: u8, value: u8) !ToolResult {
+        if (comptime builtin.os.tag != .linux) return ToolResult.fail("I2C is only supported on Linux");
         var path_buf: [32]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/dev/i2c-{d}", .{bus}) catch
             return ToolResult.fail("Invalid bus number");

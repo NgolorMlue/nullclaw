@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
@@ -104,9 +105,10 @@ fn appendSkillsSection(
     workspace_dir: []const u8,
 ) !void {
     // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
-    const home_dir = std.posix.getenv("HOME") orelse "";
-    const community_base = if (home_dir.len > 0)
-        std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills", .{home_dir}) catch null
+    const home_dir = platform.getHomeDir(allocator) catch null;
+    defer if (home_dir) |h| allocator.free(h);
+    const community_base = if (home_dir) |h|
+        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
     else
         null;
     defer if (community_base) |cb| allocator.free(cb);

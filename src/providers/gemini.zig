@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("../platform.zig");
 const root = @import("root.zig");
 
 const Provider = root.Provider;
@@ -75,9 +76,10 @@ pub fn parseCredentialsJson(allocator: std.mem.Allocator, json_bytes: []const u8
 /// Try to load Gemini CLI OAuth credentials from ~/.gemini/oauth_creds.json.
 /// Returns null on any error (file not found, parse failure, expired token, etc.).
 pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials {
-    const home: []const u8 = std.posix.getenv("HOME") orelse return null;
+    const home = platform.getHomeDir(allocator) catch return null;
+    defer allocator.free(home);
 
-    const path = std.fmt.allocPrint(allocator, "{s}/.gemini/oauth_creds.json", .{home}) catch return null;
+    const path = std.fs.path.join(allocator, &.{ home, ".gemini", "oauth_creds.json" }) catch return null;
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch return null;
