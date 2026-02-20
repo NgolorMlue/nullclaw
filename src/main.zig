@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const yc = @import("nullclaw");
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
@@ -51,10 +52,15 @@ fn parseCommand(arg: []const u8) ?Command {
     return command_map.get(arg);
 }
 
+var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = comptime alloc: {
+        if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) break :alloc debug_allocator.allocator();
+        break :alloc std.heap.smp_allocator;
+    };
+    defer if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        _ = debug_allocator.deinit();
+    };
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
