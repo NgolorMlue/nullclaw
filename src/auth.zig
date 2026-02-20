@@ -110,25 +110,34 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
         existing.deinit();
     }
 
-    // Upsert provider entry
+    // Upsert provider entry.
+    // After put() succeeds, the map owns these allocations and the defer
+    // block above handles cleanup.  The flag prevents errdefer double-frees
+    // if a subsequent try (serialization / file I/O) fails.
+    var put_succeeded = false;
     const key_owned = try allocator.dupe(u8, provider);
-    errdefer allocator.free(key_owned);
+    errdefer if (!put_succeeded) allocator.free(key_owned);
     if (existing.fetchSwapRemove(key_owned)) |old| {
         allocator.free(old.key);
         freeStoredToken(allocator, old.value);
     }
     const at_owned = try allocator.dupe(u8, token.access_token);
-    errdefer allocator.free(at_owned);
+    errdefer if (!put_succeeded) allocator.free(at_owned);
     const rt_owned: ?[]const u8 = if (token.refresh_token) |rt| try allocator.dupe(u8, rt) else null;
-    errdefer if (rt_owned) |rt| allocator.free(rt);
+    errdefer {
+        if (!put_succeeded) {
+            if (rt_owned) |rt| allocator.free(rt);
+        }
+    }
     const tt_owned = try allocator.dupe(u8, token.token_type);
-    errdefer allocator.free(tt_owned);
+    errdefer if (!put_succeeded) allocator.free(tt_owned);
     try existing.put(key_owned, .{
         .access_token = at_owned,
         .refresh_token = rt_owned,
         .expires_at = token.expires_at,
         .token_type = tt_owned,
     });
+    put_succeeded = true;
 
     // Serialize
     var buf: std.ArrayListUnmanaged(u8) = .empty;
