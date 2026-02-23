@@ -5,6 +5,7 @@
 //! (system prompt), memory_loader.zig (memory enrichment).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const providers = @import("../providers/root.zig");
@@ -560,8 +561,10 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text
-            if (display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            // There are tool calls — print intermediary text.
+            // In tests, stdout is used by Zig's test runner protocol (`--listen`),
+            // so avoid writing arbitrary text that can corrupt the control channel.
+            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
