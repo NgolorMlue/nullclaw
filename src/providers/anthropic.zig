@@ -1,6 +1,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
+const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -103,6 +104,10 @@ pub const AnthropicProvider = struct {
         defer parsed.deinit();
         const root_obj = parsed.value.object;
 
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
+
         if (root_obj.get("content")) |content_arr| {
             for (content_arr.array.items) |block| {
                 const obj = block.object;
@@ -126,6 +131,10 @@ pub const AnthropicProvider = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
         const root_obj = parsed.value.object;
+
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
 
         var text_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer text_parts.deinit(allocator);
@@ -664,6 +673,13 @@ test "parseTextResponse empty content fails" {
         \\{"content":[]}
     ;
     try std.testing.expectError(error.NoResponseContent, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse classifies rate-limit errors" {
+    const body =
+        \\{"error":{"type":"rate_limit_error","message":"Too many requests","status":429}}
+    ;
+    try std.testing.expectError(error.RateLimited, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
 }
 
 test "parseNativeResponse with text and tool_use" {

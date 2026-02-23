@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -71,6 +72,10 @@ pub const OpenRouterProvider = struct {
         defer parsed.deinit();
         const root_obj = parsed.value.object;
 
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
+
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
@@ -91,6 +96,10 @@ pub const OpenRouterProvider = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
         const root_obj = parsed.value.object;
+
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
 
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
@@ -457,6 +466,13 @@ test "parseTextResponse empty choices" {
         \\{"choices":[]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenRouterProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse classifies context errors" {
+    const body =
+        \\{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}
+    ;
+    try std.testing.expectError(error.ContextLengthExceeded, OpenRouterProvider.parseTextResponse(std.testing.allocator, body));
 }
 
 test "supportsNativeTools returns true" {

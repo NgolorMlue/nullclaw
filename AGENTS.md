@@ -25,6 +25,8 @@ Key extension points:
 - `src/runtime.zig` (`RuntimeAdapter`) — execution environments
 - `src/peripherals.zig` (`Peripheral`) — hardware boards (Arduino, STM32, RPi)
 
+Current scale: **151 source files, ~96K lines of code, 3,371 tests**.
+
 Build and test:
 
 ```bash
@@ -59,7 +61,7 @@ These codebase realities should drive every design decision:
    - SQLite: linked via `/opt/homebrew/opt/sqlite/{lib,include}` on the compile step, not the module.
    - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
 
-5. **All 1700+ tests must pass at zero leaks**
+5. **All 3,371+ tests must pass at zero leaks**
    - The test suite uses `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed.
    - `Config.load()` allocates — always wrap in `std.heap.ArenaAllocator` in tests and production.
    - `ChaCha20Poly1305.decrypt` segfaults on tag failure with heap-allocated output on macOS/Zig 0.15 — use a stack buffer then `allocator.dupe()`.
@@ -130,9 +132,9 @@ src/
   peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)
   security/             policy, pairing, secrets, sandbox backends
   memory/               SQLite + markdown backends, embeddings, vector search
-  providers/            22+ AI provider implementations
-  channels/             11 channel implementations (telegram, discord, slack, ...)
-  tools/                18 tool implementations
+  providers/            50+ AI provider implementations (9 core + 41 compatible services)
+  channels/             17 channel implementations
+  tools/                30+ tool implementations
   agent/                agent loop, context, planner
 ```
 

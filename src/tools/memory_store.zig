@@ -17,7 +17,7 @@ pub const MemoryStoreTool = struct {
         \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"}},"required":["key","content"]}
     ;
 
-    const vtable = root.ToolVTable(@This());
+    pub const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *MemoryStoreTool) Tool {
         return .{

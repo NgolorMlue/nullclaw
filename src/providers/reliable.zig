@@ -35,26 +35,53 @@ pub fn isNonRetryable(err_msg: []const u8) bool {
 
 /// Check if an error message indicates context window exhaustion.
 pub fn isContextExhausted(err_msg: []const u8) bool {
-    // Common patterns from various LLM providers
-    const has_context = std.mem.indexOf(u8, err_msg, "context") != null;
-    const has_token = std.mem.indexOf(u8, err_msg, "token") != null;
-    if (has_context and (std.mem.indexOf(u8, err_msg, "length") != null or
-        std.mem.indexOf(u8, err_msg, "maximum") != null))
+    // Case-insensitive match against common patterns from LLM providers.
+    var lower_buf: [512]u8 = undefined;
+    const check_len = @min(err_msg.len, lower_buf.len);
+    for (err_msg[0..check_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..check_len];
+
+    const has_context = std.mem.indexOf(u8, lower, "context") != null;
+    const has_token = std.mem.indexOf(u8, lower, "token") != null;
+    if (has_context and (std.mem.indexOf(u8, lower, "length") != null or
+        std.mem.indexOf(u8, lower, "maximum") != null or
+        std.mem.indexOf(u8, lower, "window") != null or
+        std.mem.indexOf(u8, lower, "exceed") != null))
         return true;
-    if (has_token and (std.mem.indexOf(u8, err_msg, "limit") != null or
-        std.mem.indexOf(u8, err_msg, "too many") != null or
-        std.mem.indexOf(u8, err_msg, "maximum") != null))
+    if (has_token and (std.mem.indexOf(u8, lower, "limit") != null or
+        std.mem.indexOf(u8, lower, "too many") != null or
+        std.mem.indexOf(u8, lower, "maximum") != null or
+        std.mem.indexOf(u8, lower, "exceed") != null))
         return true;
-    if (std.mem.indexOf(u8, err_msg, "413") != null) return true;
+    if (std.mem.indexOf(u8, lower, "413") != null and std.mem.indexOf(u8, lower, "too large") != null) return true;
     return false;
 }
 
 /// Check if an error message indicates a rate-limit (429) error.
 pub fn isRateLimited(err_msg: []const u8) bool {
-    return std.mem.indexOf(u8, err_msg, "429") != null and
-        (std.mem.indexOf(u8, err_msg, "Too Many") != null or
-            std.mem.indexOf(u8, err_msg, "rate") != null or
-            std.mem.indexOf(u8, err_msg, "limit") != null);
+    var lower_buf: [512]u8 = undefined;
+    const check_len = @min(err_msg.len, lower_buf.len);
+    for (err_msg[0..check_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..check_len];
+
+    if (std.mem.indexOf(u8, lower, "ratelimited") != null or
+        std.mem.indexOf(u8, lower, "rate limited") != null or
+        std.mem.indexOf(u8, lower, "rate_limit") != null or
+        std.mem.indexOf(u8, lower, "too many requests") != null or
+        std.mem.indexOf(u8, lower, "quota exceeded") != null or
+        std.mem.indexOf(u8, lower, "throttle") != null)
+    {
+        return true;
+    }
+
+    return std.mem.indexOf(u8, lower, "429") != null and
+        (std.mem.indexOf(u8, lower, "rate") != null or
+            std.mem.indexOf(u8, lower, "limit") != null or
+            std.mem.indexOf(u8, lower, "too many") != null);
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -262,6 +289,13 @@ pub const ReliableProvider = struct {
         return self.last_error_msg[0..self.last_error_len];
     }
 
+    fn finalFailureError(self: *const ReliableProvider) anyerror {
+        const err_slice = self.lastErrorSlice();
+        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
+        if (isRateLimited(err_slice)) return error.RateLimited;
+        return error.AllProvidersFailed;
+    }
+
     // ── Provider vtable implementation ──
 
     const vtable_impl = Provider.VTable{
@@ -304,6 +338,7 @@ pub const ReliableProvider = struct {
                 if (isNonRetryable(err_slice)) break;
 
                 if (isRateLimited(err_slice)) {
+                    if (self.extras.len > 0) break;
                     _ = self.rotateKey();
                 }
 
@@ -337,6 +372,7 @@ pub const ReliableProvider = struct {
                 if (isNonRetryable(err_slice)) break;
 
                 if (isRateLimited(err_slice)) {
+                    if (self.extras.len > 0) break;
                     _ = self.rotateKey();
                 }
 
@@ -390,7 +426,7 @@ pub const ReliableProvider = struct {
             }
         }
 
-        return error.AllProvidersFailed;
+        return self.finalFailureError();
     }
 
     fn chatImpl(
@@ -430,7 +466,7 @@ pub const ReliableProvider = struct {
             }
         }
 
-        return error.AllProvidersFailed;
+        return self.finalFailureError();
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -444,12 +480,20 @@ pub const ReliableProvider = struct {
 
     fn supportsVisionImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        return self.inner.supportsVision();
+        if (self.inner.supportsVision()) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsVision()) return true;
+        }
+        return false;
     }
 
     fn supportsVisionForModelImpl(ptr: *anyopaque, model: []const u8) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        return self.inner.supportsVisionForModel(model);
+        if (self.inner.supportsVisionForModel(model)) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsVisionForModel(model)) return true;
+        }
+        return false;
     }
 
     fn getNameImpl(ptr: *anyopaque) []const u8 {
@@ -482,6 +526,7 @@ test "isContextExhausted detects common patterns" {
     try std.testing.expect(isContextExhausted("context length exceeded"));
     try std.testing.expect(isContextExhausted("maximum context length"));
     try std.testing.expect(isContextExhausted("token limit exceeded"));
+    try std.testing.expect(isContextExhausted("ContextLengthExceeded"));
     try std.testing.expect(isContextExhausted("too many tokens in context"));
     try std.testing.expect(isContextExhausted("maximum token limit"));
     try std.testing.expect(isContextExhausted("HTTP 413 Payload Too Large"));
@@ -506,6 +551,7 @@ test "isNonRetryable detects common patterns" {
 test "isRateLimited detection" {
     try std.testing.expect(isRateLimited("429 Too Many Requests"));
     try std.testing.expect(isRateLimited("HTTP 429 rate limit exceeded"));
+    try std.testing.expect(isRateLimited("RateLimited"));
     try std.testing.expect(!isRateLimited("401 Unauthorized"));
     try std.testing.expect(!isRateLimited("500 Internal Server Error"));
 }
@@ -611,6 +657,7 @@ test "ReliableProvider computeBackoff uses base when retry-after is smaller" {
 const MockInnerProvider = struct {
     call_count: u32,
     fail_until: u32,
+    fail_error: anyerror = error.ProviderError,
     supports_tools: bool,
     supports_vision: bool = true,
     warmed_up: bool = false,
@@ -640,7 +687,7 @@ const MockInnerProvider = struct {
         const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
         self.call_count += 1;
         if (self.call_count <= self.fail_until) {
-            return error.ProviderError;
+            return self.fail_error;
         }
         return "mock response";
     }
@@ -655,7 +702,7 @@ const MockInnerProvider = struct {
         const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
         self.call_count += 1;
         if (self.call_count <= self.fail_until) {
-            return error.ProviderError;
+            return self.fail_error;
         }
         return ChatResponse{ .content = try allocator.dupe(u8, "mock chat") };
     }
@@ -818,6 +865,20 @@ test "ReliableProvider vtable exhausts retries and returns error" {
     try std.testing.expect(mock.call_count == 3);
 }
 
+test "ReliableProvider propagates context errors for recovery" {
+    var mock = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 100,
+        .fail_error = error.ContextLengthExceeded,
+        .supports_tools = false,
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 1, 50);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectError(error.ContextLengthExceeded, result);
+}
+
 test "ReliableProvider vtable chat retries then recovers" {
     var mock = MockInnerProvider{ .call_count = 0, .fail_until = 1, .supports_tools = true };
     var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 50);
@@ -841,7 +902,7 @@ test "ReliableProvider vtable delegates supportsNativeTools" {
     try std.testing.expect(reliable_no.provider().supportsNativeTools() == false);
 }
 
-test "ReliableProvider supportsVision uses inner provider capability" {
+test "ReliableProvider supportsVision checks full provider chain" {
     var inner = MockInnerProvider{
         .call_count = 0,
         .fail_until = 0,
@@ -860,8 +921,8 @@ test "ReliableProvider supportsVision uses inner provider capability" {
 
     var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
     const prov = reliable.provider();
-    try std.testing.expect(!prov.supportsVision());
-    try std.testing.expect(!prov.supportsVisionForModel("any-model"));
+    try std.testing.expect(prov.supportsVision());
+    try std.testing.expect(prov.supportsVisionForModel("any-model"));
 }
 
 test "ReliableProvider vtable delegates getName" {

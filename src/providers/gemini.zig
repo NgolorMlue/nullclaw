@@ -1,6 +1,7 @@
 const std = @import("std");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
+const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -282,15 +283,8 @@ pub const GeminiProvider = struct {
         const root_obj = parsed.value.object;
 
         // Check for error first
-        if (root_obj.get("error")) |err_obj| {
-            if (err_obj.object.get("message")) |msg| {
-                if (msg == .string) {
-                    const err_msg = try std.fmt.allocPrint(allocator, "Gemini API error: {s}", .{msg.string});
-                    defer allocator.free(err_msg);
-                    return error.ApiError;
-                }
-            }
-            return error.ApiError;
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
         }
 
         // Extract text from candidates
@@ -586,6 +580,13 @@ test "parseResponse error response" {
         \\{"error":{"message":"Invalid API key"}}
     ;
     try std.testing.expectError(error.ApiError, GeminiProvider.parseResponse(std.testing.allocator, body));
+}
+
+test "parseResponse classifies rate-limit errors" {
+    const body =
+        \\{"error":{"code":429,"message":"Too many requests"}}
+    ;
+    try std.testing.expectError(error.RateLimited, GeminiProvider.parseResponse(std.testing.allocator, body));
 }
 
 test "GeminiAuth isApiKey" {

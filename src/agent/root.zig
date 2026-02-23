@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
+const config_types = @import("../config_types.zig");
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
@@ -51,9 +52,16 @@ pub const Agent = struct {
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    /// Optional session scope for memory read/write operations.
+    memory_session_id: ?[]const u8 = null,
     observer: Observer,
     model_name: []const u8,
     model_name_owned: bool = false,
+    default_provider: []const u8 = "openrouter",
+    default_model: []const u8 = "anthropic/claude-sonnet-4",
+    configured_providers: []const config_types.ProviderEntry = &.{},
+    fallback_providers: []const []const u8 = &.{},
+    model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
     max_tool_iterations: u32,
@@ -113,6 +121,8 @@ pub const Agent = struct {
         mem: ?Memory,
         observer_i: Observer,
     ) !Agent {
+        const default_model = cfg.default_model orelse return error.NoDefaultModel;
+
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
         for (tools, 0..) |t, i| {
@@ -130,7 +140,12 @@ pub const Agent = struct {
             .tool_specs = specs,
             .mem = mem,
             .observer = observer_i,
-            .model_name = cfg.default_model orelse return error.NoDefaultModel,
+            .model_name = default_model,
+            .default_provider = cfg.default_provider,
+            .default_model = default_model,
+            .configured_providers = cfg.providers,
+            .fallback_providers = cfg.reliability.fallback_providers,
+            .model_fallbacks = cfg.reliability.model_fallbacks,
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
@@ -180,6 +195,142 @@ pub const Agent = struct {
         return compaction.forceCompressHistory(self.allocator, &self.history);
     }
 
+    fn appendUniqueString(
+        list: *std.ArrayListUnmanaged([]const u8),
+        allocator: std.mem.Allocator,
+        value: []const u8,
+    ) !void {
+        if (value.len == 0) return;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing, value)) return;
+        }
+        try list.append(allocator, value);
+    }
+
+    fn providerIsFallback(self: *const Agent, provider_name: []const u8) bool {
+        for (self.fallback_providers) |fallback_name| {
+            if (std.mem.eql(u8, fallback_name, provider_name)) return true;
+        }
+        return false;
+    }
+
+    fn providerAuthStatus(self: *const Agent, provider_name: []const u8) []const u8 {
+        if (providers.classifyProvider(provider_name) == .openai_codex_provider) {
+            return "oauth";
+        }
+
+        const resolved_key = providers.resolveApiKeyFromConfig(
+            self.allocator,
+            provider_name,
+            self.configured_providers,
+        ) catch null;
+        defer if (resolved_key) |key| self.allocator.free(key);
+
+        if (resolved_key) |key| {
+            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return "configured";
+        }
+        return "missing";
+    }
+
+    fn currentModelFallbacks(self: *const Agent) ?[]const []const u8 {
+        for (self.model_fallbacks) |entry| {
+            if (std.mem.eql(u8, entry.model, self.model_name)) return entry.fallbacks;
+        }
+        return null;
+    }
+
+    fn formatModelStatus(self: *const Agent) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const w = out.writer(self.allocator);
+
+        try w.print("Current model: {s}\n", .{self.model_name});
+        try w.print("Default model: {s}\n", .{self.default_model});
+        try w.print("Default provider: {s}\n", .{self.default_provider});
+
+        var provider_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer provider_names.deinit(self.allocator);
+        try appendUniqueString(&provider_names, self.allocator, self.default_provider);
+        for (self.configured_providers) |entry| {
+            try appendUniqueString(&provider_names, self.allocator, entry.name);
+        }
+        for (self.fallback_providers) |fallback_name| {
+            try appendUniqueString(&provider_names, self.allocator, fallback_name);
+        }
+
+        if (provider_names.items.len > 0) {
+            try w.writeAll("\nProviders:\n");
+            for (provider_names.items) |provider_name| {
+                const is_default = std.mem.eql(u8, provider_name, self.default_provider);
+                const is_fallback = self.providerIsFallback(provider_name);
+                const role_label = if (is_default and is_fallback)
+                    " [default,fallback]"
+                else if (is_default)
+                    " [default]"
+                else if (is_fallback)
+                    " [fallback]"
+                else
+                    "";
+                try w.print("  - {s}{s} (auth: {s})\n", .{
+                    provider_name,
+                    role_label,
+                    self.providerAuthStatus(provider_name),
+                });
+            }
+        }
+
+        var model_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer model_names.deinit(self.allocator);
+        try appendUniqueString(&model_names, self.allocator, self.model_name);
+        try appendUniqueString(&model_names, self.allocator, self.default_model);
+        for (self.model_fallbacks) |entry| {
+            try appendUniqueString(&model_names, self.allocator, entry.model);
+            for (entry.fallbacks) |fallback_model| {
+                try appendUniqueString(&model_names, self.allocator, fallback_model);
+            }
+        }
+
+        if (model_names.items.len > 0) {
+            try w.writeAll("\nModels:\n");
+            for (model_names.items) |model_name| {
+                const is_current = std.mem.eql(u8, model_name, self.model_name);
+                const is_default = std.mem.eql(u8, model_name, self.default_model);
+                const role_label = if (is_current and is_default)
+                    " [current,default]"
+                else if (is_current)
+                    " [current]"
+                else if (is_default)
+                    " [default]"
+                else
+                    "";
+                try w.print("  - {s}{s}\n", .{ model_name, role_label });
+            }
+        }
+
+        try w.writeAll("\nProvider chain: ");
+        try w.writeAll(self.default_provider);
+        if (self.fallback_providers.len == 0) {
+            try w.writeAll(" (no fallback providers)");
+        } else {
+            for (self.fallback_providers) |fallback_provider| {
+                try w.print(" -> {s}", .{fallback_provider});
+            }
+        }
+
+        try w.writeAll("\nModel chain: ");
+        try w.writeAll(self.model_name);
+        if (self.currentModelFallbacks()) |fallbacks| {
+            for (fallbacks) |fallback_model| {
+                try w.print(" -> {s}", .{fallback_model});
+            }
+        } else {
+            try w.writeAll(" (no configured fallbacks)");
+        }
+
+        try w.writeAll("\nSwitch: /model <name>");
+        return try out.toOwnedSlice(self.allocator);
+    }
+
     /// Handle slash commands that don't require LLM.
     /// Returns an owned response string, or null if not a slash command.
     pub fn handleSlashCommand(self: *Agent, message: []const u8) !?[]const u8 {
@@ -190,7 +341,7 @@ pub const Agent = struct {
             // Clear stale auto-saved memories to prevent re-injection
             if (self.mem) |mem| {
                 if (mem.asSqlite()) |sqlite_mem| {
-                    sqlite_mem.clearAutoSaved() catch {};
+                    sqlite_mem.clearAutoSaved(self.memory_session_id) catch {};
                 }
             }
             return try self.allocator.dupe(u8, "Session cleared.");
@@ -202,6 +353,7 @@ pub const Agent = struct {
                 \\  /new     — Clear conversation history and start fresh
                 \\  /help    — Show this help message
                 \\  /status  — Show current model, provider and session stats
+                \\  /model   — Show current model, providers and fallback chains
                 \\  /model <name> — Switch to a different model
                 \\  exit, quit — Exit interactive mode
             );
@@ -225,8 +377,11 @@ pub const Agent = struct {
                 std.mem.trim(u8, trimmed["/model".len..], " \t")
             else
                 "";
-            if (arg.len == 0) {
-                return try std.fmt.allocPrint(self.allocator, "Current model: {s}", .{self.model_name});
+            if (arg.len == 0 or
+                std.ascii.eqlIgnoreCase(arg, "list") or
+                std.ascii.eqlIgnoreCase(arg, "status"))
+            {
+                return try self.formatModelStatus();
             }
             if (self.model_name_owned) self.allocator.free(self.model_name);
             self.model_name = try self.allocator.dupe(u8, arg);
@@ -278,14 +433,14 @@ pub const Agent = struct {
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
-                    mem.store(key, user_message, .conversation, null) catch {};
+                    mem.store(key, user_message, .conversation, self.memory_session_id) catch {};
                 }
             }
         }
 
         // Enrich message with memory context (always returns owned slice; ownership → history)
         const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessage(self.allocator, mem, user_message)
+            try memory_loader.enrichMessage(self.allocator, mem, user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, user_message);
         errdefer self.allocator.free(enriched);
@@ -547,7 +702,7 @@ pub const Agent = struct {
                         const ts = @as(u64, @intCast(std.time.timestamp()));
                         const save_key = try std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts});
                         defer self.allocator.free(save_key);
-                        mem.store(save_key, summary, .daily, null) catch {};
+                        mem.store(save_key, summary, .daily, self.memory_session_id) catch {};
                     }
                 }
 
@@ -1493,6 +1648,13 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     };
 }
 
+fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), name)) return t;
+    }
+    return null;
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -1565,6 +1727,52 @@ test "slash /model without name shows current" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "slash /model list aliases to model status" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/model list")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Current model: test-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Switch: /model <name>") != null);
+}
+
+test "slash /model shows provider and model fallback chains" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "openai-codex" },
+        .{ .name = "openrouter", .api_key = "sk-or-test" },
+    };
+    const model_fallbacks = [_]config_types.ModelFallbackEntry{
+        .{
+            .model = "gpt-5.3-codex",
+            .fallbacks = &.{"openrouter/anthropic/claude-sonnet-4"},
+        },
+    };
+
+    agent.model_name = "gpt-5.3-codex";
+    agent.default_model = "gpt-5.3-codex";
+    agent.default_provider = "openai-codex";
+    agent.configured_providers = &configured_providers;
+    agent.fallback_providers = &.{"openrouter"};
+    agent.model_fallbacks = &model_fallbacks;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Provider chain: openai-codex -> openrouter") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        response,
+        "Model chain: gpt-5.3-codex -> openrouter/anthropic/claude-sonnet-4",
+    ) != null);
 }
 
 test "non-slash message returns null" {
@@ -1640,6 +1848,94 @@ test "milliTimestamp negative difference clamps to zero" {
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
     try std.testing.expectEqual(@as(u64, 0), duration);
+}
+
+test "bindMemoryTools wires memory tools to sqlite backend" {
+    const allocator = std.testing.allocator;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+
+    const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{});
+    defer tools_mod.deinitTools(allocator, tools);
+
+    var mem = try memory_mod.createMemory(allocator, "sqlite", ":memory:");
+    defer mem.deinit();
+    tools_mod.bindMemoryTools(tools, mem);
+
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{};
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var dummy_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const provider_i = Provider{
+        .ptr = @ptrCast(&dummy_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(
+        allocator,
+        &cfg,
+        provider_i,
+        tools,
+        mem,
+        noop.observer(),
+    );
+    defer agent.deinit();
+
+    const store_tool = find_tool_by_name(tools, "memory_store").?;
+    const store_args = try tools_mod.parseTestArgs("{\"key\":\"preference.test\",\"content\":\"123\"}");
+    defer store_args.deinit();
+
+    const store_result = try store_tool.execute(allocator, store_args.value.object);
+    defer if (store_result.output.len > 0) allocator.free(store_result.output);
+    try std.testing.expect(store_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, store_result.output, "Stored memory") != null);
+
+    const entry = try mem.get(allocator, "preference.test");
+    try std.testing.expect(entry != null);
+    if (entry) |e| {
+        defer e.deinit(allocator);
+        try std.testing.expectEqualStrings("123", e.content);
+    }
+
+    const recall_tool = find_tool_by_name(tools, "memory_recall").?;
+    const recall_args = try tools_mod.parseTestArgs("{\"query\":\"preference.test\"}");
+    defer recall_args.deinit();
+
+    const recall_result = try recall_tool.execute(allocator, recall_args.value.object);
+    defer if (recall_result.output.len > 0) allocator.free(recall_result.output);
+    try std.testing.expect(recall_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, recall_result.output, "preference.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recall_result.output, "123") != null);
 }
 
 test "Agent tool loop frees dynamic tool outputs" {

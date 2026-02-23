@@ -16,7 +16,7 @@ pub const MemoryForgetTool = struct {
         \\{"type":"object","properties":{"key":{"type":"string","description":"The key of the memory to forget"}},"required":["key"]}
     ;
 
-    const vtable = root.ToolVTable(@This());
+    pub const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *MemoryForgetTool) Tool {
         return .{

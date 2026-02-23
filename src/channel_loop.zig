@@ -16,8 +16,27 @@ const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
+const agent_routing = @import("agent_routing.zig");
+const provider_runtime = @import("providers/runtime_bundle.zig");
+
+const signal = @import("channels/signal.zig");
+const matrix = @import("channels/matrix.zig");
+const channels_mod = @import("channels/root.zig");
 
 const log = std.log.scoped(.channel_loop);
+
+fn signalGroupPeerId(reply_target: ?[]const u8) []const u8 {
+    const target = reply_target orelse "unknown";
+    if (std.mem.startsWith(u8, target, signal.GROUP_TARGET_PREFIX)) {
+        const raw = target[signal.GROUP_TARGET_PREFIX.len..];
+        if (raw.len > 0) return raw;
+    }
+    return target;
+}
+
+fn matrixRoomPeerId(reply_target: ?[]const u8) []const u8 {
+    return reply_target orelse "unknown";
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // TelegramLoopState — shared state between supervisor and polling thread
@@ -48,28 +67,20 @@ pub const ProviderHolder = providers.ProviderHolder;
 
 pub const ChannelRuntime = struct {
     allocator: std.mem.Allocator,
+    config: *const Config,
     session_mgr: session_mod.SessionManager,
-    provider_holder: *ProviderHolder,
+    provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
     mem: ?memory_mod.Memory,
     noop_obs: *observability.NoopObserver,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
-        // Resolve API key: config providers first, then env vars
-        const resolved_key = providers.resolveApiKeyFromConfig(
-            allocator,
-            config.default_provider,
-            config.providers,
-        ) catch null;
+        var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
+        errdefer runtime_provider.deinit();
 
-        // Provider — heap-allocated for vtable pointer stability
-        const holder = try allocator.create(ProviderHolder);
-        errdefer allocator.destroy(holder);
-
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key);
-
-        const provider_i = holder.provider();
+        const provider_i = runtime_provider.provider();
+        const resolved_key = runtime_provider.primaryApiKey();
 
         // MCP tools
         const mcp_tools: ?[]const tools_mod.Tool = if (config.mcp_servers.len > 0)
@@ -79,6 +90,7 @@ pub const ChannelRuntime = struct {
             }
         else
             null;
+        defer if (mcp_tools) |mt| allocator.free(mt);
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
@@ -90,7 +102,7 @@ pub const ChannelRuntime = struct {
             .fallback_api_key = resolved_key,
             .tools_config = config.tools,
         }) catch &.{};
-        errdefer if (tools.len > 0) allocator.free(tools);
+        errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
         // Optional memory backend
         var mem_opt: ?memory_mod.Memory = null;
@@ -101,6 +113,7 @@ pub const ChannelRuntime = struct {
                 mem_opt = mem;
             } else |_| {}
         }
+        errdefer if (mem_opt) |m| m.deinit();
 
         // Noop observer (heap for vtable stability)
         const noop_obs = try allocator.create(observability.NoopObserver);
@@ -115,8 +128,9 @@ pub const ChannelRuntime = struct {
         const self = try allocator.create(ChannelRuntime);
         self.* = .{
             .allocator = allocator,
+            .config = config,
             .session_mgr = session_mgr,
-            .provider_holder = holder,
+            .provider_bundle = runtime_provider,
             .tools = tools,
             .mem = mem_opt,
             .noop_obs = noop_obs,
@@ -127,9 +141,10 @@ pub const ChannelRuntime = struct {
     pub fn deinit(self: *ChannelRuntime) void {
         const alloc = self.allocator;
         self.session_mgr.deinit();
-        if (self.tools.len > 0) alloc.free(self.tools);
+        if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
+        if (self.mem) |m| m.deinit();
+        self.provider_bundle.deinit();
         alloc.destroy(self.noop_obs);
-        alloc.destroy(self.provider_holder);
         alloc.destroy(self);
     }
 };
@@ -141,20 +156,17 @@ pub const ChannelRuntime = struct {
 /// Thread-entry function for the Telegram polling loop.
 /// Mirrors main.zig:793-866 but checks `loop_state.stop_requested` and
 /// `daemon.isShutdownRequested()` for graceful shutdown.
+///
+/// `tg_ptr` is the channel instance owned by the supervisor (ChannelManager).
+/// The polling loop uses it directly instead of creating a second
+/// TelegramChannel, so health checks and polling operate on the same object.
 pub fn runTelegramLoop(
     allocator: std.mem.Allocator,
     config: *const Config,
     runtime: *ChannelRuntime,
     loop_state: *TelegramLoopState,
+    tg_ptr: *telegram.TelegramChannel,
 ) void {
-    const telegram_config = config.channels.telegram orelse return;
-
-    // Heap-alloc TelegramChannel for vtable pointer stability
-    const tg_ptr = allocator.create(telegram.TelegramChannel) catch return;
-    defer allocator.destroy(tg_ptr);
-    tg_ptr.* = telegram.TelegramChannel.init(allocator, telegram_config.bot_token, telegram_config.allow_from);
-    tg_ptr.proxy = telegram_config.proxy;
-
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
     if (config.getProviderKey(trans.provider)) |key| {
@@ -209,12 +221,23 @@ pub fn runTelegramLoop(
             }
 
             // Reply-to logic
-            const use_reply_to = msg.is_group or telegram_config.reply_in_private;
+            const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            // Session key
+            // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "telegram",
+                    .account_id = tg_ptr.account_id,
+                    .peer = .{ .kind = if (msg.is_group) .group else .direct, .id = msg.sender },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "telegram:{s}:{s}", .{ tg_ptr.account_id, msg.sender }) catch msg.sender;
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
 
             // Typing indicator
             typing.start(msg.sender);
@@ -225,6 +248,7 @@ pub fn runTelegramLoop(
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
                     error.OutOfMemory => "Out of memory.",
                     else => "An error occurred. Try again or /new for a fresh session.",
                 };
@@ -255,6 +279,324 @@ pub fn runTelegramLoop(
         }
 
         health.markComponentOk("telegram");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SignalLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const SignalLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: std.atomic.Value(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: std.atomic.Value(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() SignalLoopState {
+        return .{
+            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
+            .stop_requested = std.atomic.Value(bool).init(false),
+        };
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// runSignalLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Thread-entry function for the Signal SSE polling loop.
+/// Mirrors runTelegramLoop but uses signal-cli's SSE/JSON-RPC API.
+/// Checks `loop_state.stop_requested` and `daemon.isShutdownRequested()`
+/// for graceful shutdown.
+pub fn runSignalLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *SignalLoopState,
+    sg_ptr: *signal.SignalChannel,
+) void {
+    // Update activity timestamp at start
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = sg_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Signal poll error: {}", .{err});
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(5 * std.time.ns_per_s);
+            continue;
+        };
+
+        // Update activity after each poll (even if no messages)
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            // Session key — always resolve through agent routing (falls back on errors)
+            var key_buf: [128]u8 = undefined;
+            const group_peer_id = signalGroupPeerId(msg.reply_target);
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "signal",
+                    .account_id = sg_ptr.account_id,
+                    .peer = .{
+                        .kind = if (msg.is_group) .group else .direct,
+                        .id = if (msg.is_group) group_peer_id else msg.sender,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk if (msg.is_group)
+                    std.fmt.bufPrint(&key_buf, "signal:{s}:group:{s}:{s}", .{
+                        sg_ptr.account_id,
+                        group_peer_id,
+                        msg.sender,
+                    }) catch msg.sender
+                else
+                    std.fmt.bufPrint(&key_buf, "signal:{s}:{s}", .{ sg_ptr.account_id, msg.sender }) catch msg.sender;
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            // Send typing indicator (best-effort)
+            if (msg.reply_target) |target| {
+                sg_ptr.sendTypingIndicator(target);
+            }
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+                log.err("Signal agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                if (msg.reply_target) |target| {
+                    sg_ptr.sendMessage(target, err_msg) catch |send_err| log.err("failed to send signal error reply: {}", .{send_err});
+                }
+                continue;
+            };
+            defer allocator.free(reply);
+
+            // Reply on Signal
+            if (msg.reply_target) |target| {
+                sg_ptr.sendMessage(target, reply) catch |err| {
+                    log.warn("Signal send error: {}", .{err});
+                };
+            }
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        // Periodic session eviction
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("signal");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MatrixLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const MatrixLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: std.atomic.Value(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: std.atomic.Value(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() MatrixLoopState {
+        return .{
+            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
+            .stop_requested = std.atomic.Value(bool).init(false),
+        };
+    }
+};
+
+pub const PollingState = union(enum) {
+    telegram: *TelegramLoopState,
+    signal: *SignalLoopState,
+    matrix: *MatrixLoopState,
+};
+
+pub const PollingSpawnResult = struct {
+    thread: std.Thread,
+    state: PollingState,
+};
+
+pub fn spawnTelegramPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const tg_ls = try allocator.create(TelegramLoopState);
+    errdefer allocator.destroy(tg_ls);
+    tg_ls.* = TelegramLoopState.init();
+
+    const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        runTelegramLoop,
+        .{ allocator, config, runtime, tg_ls, tg_ptr },
+    );
+    tg_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .telegram = tg_ls },
+    };
+}
+
+pub fn spawnSignalPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const sg_ls = try allocator.create(SignalLoopState);
+    errdefer allocator.destroy(sg_ls);
+    sg_ls.* = SignalLoopState.init();
+
+    const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        runSignalLoop,
+        .{ allocator, config, runtime, sg_ls, sg_ptr },
+    );
+    sg_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .signal = sg_ls },
+    };
+}
+
+pub fn spawnMatrixPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const mx_ls = try allocator.create(MatrixLoopState);
+    errdefer allocator.destroy(mx_ls);
+    mx_ls.* = MatrixLoopState.init();
+
+    const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        runMatrixLoop,
+        .{ allocator, config, runtime, mx_ls, mx_ptr },
+    );
+    mx_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .matrix = mx_ls },
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// runMatrixLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Thread-entry function for Matrix /sync polling.
+/// Uses account-aware route resolution and per-room reply targets.
+pub fn runMatrixLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *MatrixLoopState,
+    mx_ptr: *matrix.MatrixChannel,
+) void {
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = mx_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Matrix poll error: {}", .{err});
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            std.Thread.sleep(5 * std.time.ns_per_s);
+            continue;
+        };
+
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            var key_buf: [192]u8 = undefined;
+            const room_peer_id = matrixRoomPeerId(msg.reply_target);
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "matrix",
+                    .account_id = mx_ptr.account_id,
+                    .peer = .{
+                        .kind = if (msg.is_group) .group else .direct,
+                        .id = if (msg.is_group) room_peer_id else msg.sender,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk if (msg.is_group)
+                    std.fmt.bufPrint(&key_buf, "matrix:{s}:room:{s}", .{ mx_ptr.account_id, room_peer_id }) catch msg.sender
+                else
+                    std.fmt.bufPrint(&key_buf, "matrix:{s}:{s}", .{ mx_ptr.account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            const typing_target = msg.reply_target orelse msg.sender;
+            mx_ptr.sendTypingIndicator(typing_target);
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content) catch |err| {
+                log.err("Matrix agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
+                continue;
+            };
+            defer allocator.free(reply);
+
+            mx_ptr.sendMessage(typing_target, reply) catch |err| {
+                log.warn("Matrix send error: {}", .{err});
+            };
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("matrix");
     }
 }
 
@@ -294,4 +636,66 @@ test "ProviderHolder tagged union fields" {
     try std.testing.expect(@hasField(ProviderHolder, "ollama"));
     try std.testing.expect(@hasField(ProviderHolder, "compatible"));
     try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
+}
+
+test "SignalLoopState init defaults" {
+    const state = SignalLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "SignalLoopState stop_requested toggle" {
+    var state = SignalLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "SignalLoopState last_activity update" {
+    var state = SignalLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "MatrixLoopState init defaults" {
+    const state = MatrixLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "MatrixLoopState stop_requested toggle" {
+    var state = MatrixLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "MatrixLoopState last_activity update" {
+    var state = MatrixLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "signalGroupPeerId extracts group id from reply target" {
+    const peer_id = signalGroupPeerId("group:1203630@g.us");
+    try std.testing.expectEqualStrings("1203630@g.us", peer_id);
+}
+
+test "signalGroupPeerId falls back when reply target is missing or malformed" {
+    try std.testing.expectEqualStrings("unknown", signalGroupPeerId(null));
+    try std.testing.expectEqualStrings("group:", signalGroupPeerId("group:"));
+    try std.testing.expectEqualStrings("direct:+15550001111", signalGroupPeerId("direct:+15550001111"));
+}
+
+test "matrixRoomPeerId falls back when reply target is missing" {
+    try std.testing.expectEqualStrings("unknown", matrixRoomPeerId(null));
+    try std.testing.expectEqualStrings("!room:example", matrixRoomPeerId("!room:example"));
 }

@@ -17,7 +17,7 @@ pub const MemoryRecallTool = struct {
         \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"}},"required":["query"]}
     ;
 
-    const vtable = root.ToolVTable(@This());
+    pub const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *MemoryRecallTool) Tool {
         return .{
