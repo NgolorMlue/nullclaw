@@ -152,7 +152,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    try yc.gateway.run(allocator, cfg.gateway.host, cfg.gateway.port, &cfg, null);
+    try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
 
 // ── Daemon ───────────────────────────────────────────────────────
@@ -684,6 +684,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // Usage: nullclaw channel start [channel]
 // If a channel name is given, start that specific channel.
 // Otherwise, start the first available (Telegram first, then Signal).
+// To run all configured channels/accounts together, use `nullclaw gateway`.
 
 fn canStartFromChannelCommand(channel_id: yc.channel_catalog.ChannelId) bool {
     return switch (channel_id) {
@@ -733,7 +734,26 @@ fn dispatchChannelStart(
     }
 }
 
+fn hasConfiguredStartableChannels(config: *const yc.config.Config) bool {
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (!canStartFromChannelCommand(meta.id)) continue;
+        if (yc.channel_catalog.isConfigured(config, meta.id)) return true;
+    }
+    return false;
+}
+
+fn printNoMessagingChannelConfiguredHint() void {
+    std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
+    std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
+    std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
+}
+
 fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--all")) {
+        std.debug.print("Use `nullclaw gateway` to start all configured channels/accounts.\n", .{});
+        std.process.exit(1);
+    }
+
     // Load config
     var config = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
@@ -746,20 +766,8 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         std.process.exit(1);
     };
 
-    // Check which channels are configured
-    var has_any = false;
-    for (yc.channel_catalog.known_channels) |meta| {
-        if (!canStartFromChannelCommand(meta.id)) continue;
-        if (yc.channel_catalog.isConfigured(&config, meta.id)) {
-            has_any = true;
-            break;
-        }
-    }
-
-    if (!has_any) {
-        std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
-        std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
-        std.debug.print("  Signal:   {{\"channels\": {{\"signal\": {{\"accounts\": {{\"main\": {{\"http_url\": \"http://127.0.0.1:8080\", \"account\": \"+1234567890\"}}}}}}}}\n", .{});
+    if (!hasConfiguredStartableChannels(&config)) {
+        printNoMessagingChannelConfiguredHint();
         std.process.exit(1);
     }
 
@@ -1834,4 +1842,35 @@ test "applyGatewayDaemonOverrides rejects invalid port" {
     };
     const args = [_][]const u8{ "--port", "bad" };
     try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
+}
+
+test "hasConfiguredStartableChannels ignores cli and webhook-only defaults" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .cli = true,
+            .webhook = .{ .port = 8080 },
+        },
+    };
+
+    try std.testing.expect(!hasConfiguredStartableChannels(&cfg));
+}
+
+test "hasConfiguredStartableChannels returns true when telegram configured" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &[_]yc.config.TelegramConfig{
+                .{ .account_id = "main", .bot_token = "123:abc" },
+            },
+        },
+    };
+
+    try std.testing.expect(hasConfiguredStartableChannels(&cfg));
 }
