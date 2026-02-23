@@ -5,6 +5,7 @@
 //! (system prompt), memory_loader.zig (memory enrichment).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const providers = @import("../providers/root.zig");
@@ -560,8 +561,10 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text
-            if (display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            // There are tool calls — print intermediary text.
+            // In tests, stdout is used by Zig's test runner protocol (`--listen`),
+            // so avoid writing arbitrary text that can corrupt the control channel.
+            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
@@ -594,7 +597,7 @@ pub const Agent = struct {
                 self.observer.recordEvent(&tool_start_event);
 
                 const tool_timer = std.time.milliTimestamp();
-                const result = self.executeTool(call);
+                const result = self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
                 const tool_event = ObserverEvent{ .tool_call = .{
@@ -693,7 +696,7 @@ pub const Agent = struct {
 
     /// Execute a tool by name lookup.
     /// Parses arguments_json once into a std.json.ObjectMap and passes it to the tool.
-    fn executeTool(self: *Agent, call: ParsedToolCall) ToolExecutionResult {
+    fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
@@ -720,7 +723,7 @@ pub const Agent = struct {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,
-                    self.allocator,
+                    tool_allocator,
                     call.arguments_json,
                     .{},
                 ) catch {
@@ -745,7 +748,7 @@ pub const Agent = struct {
                     },
                 };
 
-                const result = t.execute(self.allocator, args) catch |err| {
+                const result = t.execute(tool_allocator, args) catch |err| {
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -1637,6 +1640,127 @@ test "milliTimestamp negative difference clamps to zero" {
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
     try std.testing.expectEqual(@as(u64, 0), duration);
+}
+
+test "Agent tool loop frees dynamic tool outputs" {
+    const DynamicOutputTool = struct {
+        const Self = @This();
+        pub const tool_name = "leak_probe";
+        pub const tool_description = "Returns dynamically allocated tool output";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "dynamic-tool-output"),
+            };
+        }
+    };
+
+    const StepProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, "leak_probe"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+
+                return .{
+                    .content = try allocator.dupe(u8, "Running tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "step-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = StepProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StepProvider.chatWithSystem,
+        .chat = StepProvider.chat,
+        .supportsNativeTools = StepProvider.supportsNativeTools,
+        .getName = StepProvider.getName,
+        .deinit = StepProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = DynamicOutputTool{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run tool");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
 test "Agent streaming fields can be set" {
