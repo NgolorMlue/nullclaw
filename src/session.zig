@@ -112,6 +112,7 @@ pub const SessionManager = struct {
             self.observer,
         );
         agent.policy = self.policy;
+        agent.memory_session_id = owned_key;
 
         session.* = .{
             .agent = agent,
@@ -167,7 +168,7 @@ pub const SessionManager = struct {
                     // Clear persisted messages on session reset
                     sqlite_mem.clearMessages(session_key) catch {};
                     // Clear stale auto-saved memories
-                    sqlite_mem.clearAutoSaved() catch {};
+                    sqlite_mem.clearAutoSaved(session_key) catch {};
                 } else if (!std.mem.startsWith(u8, trimmed, "/")) {
                     // Persist user + assistant messages (skip slash commands)
                     sqlite_mem.saveMessage(session_key, "user", content) catch {};
@@ -460,6 +461,43 @@ test "processMessage different keys — independent sessions" {
     try testing.expect(sa != sb);
     try testing.expectEqual(@as(u64, 1), sa.turn_count);
     try testing.expectEqual(@as(u64, 1), sb.turn_count);
+}
+
+test "processMessage /new clears autosave only for current session" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        mem,
+        noop.observer(),
+    );
+    defer sm.deinit();
+
+    // Seed autosave entries for two different sessions.
+    try mem.store("autosave_user_a", "session a", .conversation, "sess-a");
+    try mem.store("autosave_user_b", "session b", .conversation, "sess-b");
+    try testing.expectEqual(@as(usize, 2), try mem.count());
+
+    const response = try sm.processMessage("sess-a", "/new");
+    defer testing.allocator.free(response);
+
+    const a_entry = try mem.get(testing.allocator, "autosave_user_a");
+    defer if (a_entry) |entry| entry.deinit(testing.allocator);
+    try testing.expect(a_entry == null);
+
+    const b_entry = try mem.get(testing.allocator, "autosave_user_b");
+    defer if (b_entry) |entry| entry.deinit(testing.allocator);
+    try testing.expect(b_entry != null);
+    try testing.expectEqualStrings("session b", b_entry.?.content);
 }
 
 // ---------------------------------------------------------------------------

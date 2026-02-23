@@ -24,8 +24,9 @@ pub fn loadContext(
     allocator: std.mem.Allocator,
     mem: Memory,
     user_message: []const u8,
+    session_id: ?[]const u8,
 ) ![]const u8 {
-    const entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, null) catch {
+    const entries = mem.recall(allocator, user_message, DEFAULT_RECALL_LIMIT, session_id) catch {
         return try allocator.dupe(u8, "");
     };
     defer memory_mod.freeEntries(allocator, entries);
@@ -53,8 +54,9 @@ pub fn enrichMessage(
     allocator: std.mem.Allocator,
     mem: Memory,
     user_message: []const u8,
+    session_id: ?[]const u8,
 ) ![]const u8 {
-    const context = try loadContext(allocator, mem, user_message);
+    const context = try loadContext(allocator, mem, user_message, session_id);
     if (context.len == 0) {
         allocator.free(context);
         return try allocator.dupe(u8, user_message);
@@ -73,7 +75,7 @@ test "loadContext returns empty for no-op memory" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const context = try loadContext(allocator, mem, "hello");
+    const context = try loadContext(allocator, mem, "hello", null);
     defer allocator.free(context);
 
     try std.testing.expectEqualStrings("", context);
@@ -84,7 +86,7 @@ test "enrichMessage with no context returns original" {
     var none_mem = memory_mod.NoneMemory.init();
     const mem = none_mem.memory();
 
-    const enriched = try enrichMessage(allocator, mem, "hello");
+    const enriched = try enrichMessage(allocator, mem, "hello", null);
     defer allocator.free(enriched);
 
     try std.testing.expectEqualStrings("hello", enriched);
