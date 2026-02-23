@@ -780,15 +780,24 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /line, POST /lark
-pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
+/// If config_ptr is null, loads config internally (for backward compatibility).
+pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config) !void {
     health.markComponentOk("gateway");
 
     var state = GatewayState.init(allocator);
     defer state.deinit();
 
-    // Load config and set up in-process SessionManager (graceful degradation if no config).
-    var config_opt: ?Config = Config.load(allocator) catch null;
-    defer if (config_opt) |*c| c.deinit();
+    var owned_config: ?Config = null;
+    var config_opt: ?*const Config = null;
+    if (config_ptr) |cfg| {
+        config_opt = cfg;
+    } else {
+        owned_config = Config.load(allocator) catch null;
+        if (owned_config) |*c| {
+            config_opt = c;
+        }
+    }
+    defer if (owned_config) |*c| c.deinit();
 
     // ProviderHolder: concrete provider struct must outlive the accept loop.
     var holder_opt: ?providers.ProviderHolder = null;
@@ -796,7 +805,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
 
-    if (config_opt) |*cfg| {
+    if (config_opt) |cfg_ptr| {
+        const cfg = cfg_ptr;
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -1087,7 +1097,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                             // Process the message in-process
                             if (session_mgr_opt) |*sm| {
                                 var kb: [64]u8 = undefined;
-                                const tg_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                                const tg_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                                 const sk = telegramSessionKeyRouted(req_allocator, &kb, chat_id.?, b, tg_cfg_opt, state.telegram_account_id);
                                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?) catch |err| blk: {
                                     if (err == error.ProviderDoesNotSupportVision) {
@@ -1173,7 +1183,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                             if (msg_text) |mt| {
                                 if (session_mgr_opt) |*sm| {
                                     var wa_key_buf: [256]u8 = undefined;
-                                    const wa_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                                    const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                                     const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, state.whatsapp_account_id);
                                     const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
                                         if (err == error.ProviderDoesNotSupportVision) {
@@ -1215,7 +1225,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                             if (msg_text) |mt| {
                                 if (session_mgr_opt) |*sm| {
                                     var wa_key_buf: [256]u8 = undefined;
-                                    const wa_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                                    const wa_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                                     const wa_session_key = whatsappSessionKeyRouted(req_allocator, &wa_key_buf, b, wa_cfg_opt, state.whatsapp_account_id);
                                     const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt) catch |err| blk: {
                                         if (err == error.ProviderDoesNotSupportVision) {
@@ -1282,7 +1292,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                             if (evt.message_text) |text| {
                                 if (session_mgr_opt) |*sm| {
                                     var kb: [128]u8 = undefined;
-                                    const line_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                                    const line_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                                     const sk = lineSessionKeyRouted(req_allocator, &kb, evt, line_cfg_opt, state.line_account_id);
                                     const reply: ?[]const u8 = sm.processMessage(sk, text) catch null;
                                     if (reply) |r| {
@@ -1365,7 +1375,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                     for (messages) |msg| {
                         if (session_mgr_opt) |*sm| {
                             var kb: [128]u8 = undefined;
-                            const lark_cfg_opt: ?*const Config = if (config_opt) |*cfg| cfg else null;
+                            const lark_cfg_opt: ?*const Config = if (config_opt) |cfg| cfg else null;
                             const sk = larkSessionKeyRouted(req_allocator, &kb, msg, lark_cfg_opt, state.lark_account_id);
                             const reply: ?[]const u8 = sm.processMessage(sk, msg.content) catch null;
                             if (reply) |r| {

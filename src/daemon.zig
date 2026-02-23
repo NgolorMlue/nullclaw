@@ -150,9 +150,9 @@ pub fn isShutdownRequested() bool {
 }
 
 /// Gateway thread entry point.
-fn gatewayThread(allocator: std.mem.Allocator, host: []const u8, port: u16, state: *DaemonState) void {
+fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port) catch |err| {
+    gateway.run(allocator, host, port, config) catch |err| {
         state.markError("gateway", @errorName(err));
         health.markComponentError("gateway", @errorName(err));
         return;
@@ -433,7 +433,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, host, port, &state }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;

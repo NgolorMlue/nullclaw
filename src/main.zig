@@ -58,20 +58,13 @@ fn parseCommand(arg: []const u8) ?Command {
     return command_map.get(arg);
 }
 
-var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 pub fn main() !void {
     // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
     if (comptime builtin.os.tag == .windows) {
         _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
     }
 
-    const allocator = comptime alloc: {
-        if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) break :alloc debug_allocator.allocator();
-        break :alloc std.heap.smp_allocator;
-    };
-    defer if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
-        _ = debug_allocator.deinit();
-    };
+    const allocator = std.heap.smp_allocator;
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -143,7 +136,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         }
     }
 
-    try yc.gateway.run(allocator, host, port);
+    try yc.gateway.run(allocator, host, port, &cfg);
 }
 
 // ── Daemon ───────────────────────────────────────────────────────
