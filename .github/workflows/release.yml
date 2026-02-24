@@ -130,22 +130,37 @@ jobs:
           owner_type="$(gh api "/users/${OWNER}" --jq .type)"
           if [[ "${owner_type}" == "Organization" ]]; then
             package_endpoint="/orgs/${OWNER}/packages/container/${PACKAGE}"
+            settings_url="https://github.com/orgs/${OWNER}/packages/container/${PACKAGE}/settings"
           else
             package_endpoint="/user/packages/container/${PACKAGE}"
+            settings_url="https://github.com/users/${OWNER}/packages/container/package/${PACKAGE}/settings"
           fi
 
-          gh api -X PATCH \
-            -H "Accept: application/vnd.github+json" \
-            "${package_endpoint}/visibility" \
-            -f visibility=public >/dev/null
-
-          visibility="$(gh api -H "Accept: application/vnd.github+json" "${package_endpoint}" --jq .visibility)"
-          if [[ "${visibility}" != "public" ]]; then
-            echo "::error::Expected ghcr package visibility to be public, got '${visibility}'."
-            exit 1
+          visibility_before="$(gh api -H "Accept: application/vnd.github+json" "${package_endpoint}" --jq .visibility 2>/dev/null || echo unknown)"
+          if [[ "${visibility_before}" == "public" ]]; then
+            echo "GHCR package visibility already public."
+            exit 0
           fi
 
-          echo "GHCR package visibility is public."
+          if [[ "${visibility_before}" == "private" ]]; then
+            if gh api -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "${package_endpoint}/visibility" \
+              -f visibility=public >/dev/null 2>&1; then
+              echo "Requested GHCR package visibility=public."
+            else
+              echo "::warning::Could not update GHCR visibility via API. Set package visibility manually: ${settings_url}"
+            fi
+          else
+            echo "::warning::Could not determine current package visibility (got '${visibility_before}')."
+          fi
+
+          visibility_after="$(gh api -H "Accept: application/vnd.github+json" "${package_endpoint}" --jq .visibility 2>/dev/null || echo unknown)"
+          if [[ "${visibility_after}" != "public" ]]; then
+            echo "::warning::GHCR package visibility is '${visibility_after}'. Public pull check below will enforce actual accessibility."
+          else
+            echo "GHCR package visibility is public."
+          fi
 
       - name: Verify GHCR image is publicly pullable
         env:
